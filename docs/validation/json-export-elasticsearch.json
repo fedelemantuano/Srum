@@ -1,0 +1,17 @@
+{
+  "elasticsearch_version": "8.19.0",
+  "documents_created": 14,
+  "bulk_errors": false,
+  "category_counts": {
+    "AppResourceUseInfo": 2,
+    "EnergyUsage": 2,
+    "NetworkConnection": 2,
+    "NetworkUsage": 2,
+    "PushNotification": 2,
+    "TimelineProvider": 2,
+    "Vfuprov": 2
+  },
+  "network_usage_filter_count": 2,
+  "source_timestamp": "2026-10-09T12:34:56.1234567Z",
+  "indexed_timestamp": "2026-10-09T12:34:56.123Z"
+}

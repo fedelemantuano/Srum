@@ -43,6 +43,8 @@ public class ApplicationArguments
     public string FileReg { get; set; }
     public string Directory { get; set; }
     public string CsvDirectory { get; set; }
+    public string JsonDirectory { get; set; }
+    public string JsonFilename { get; set; }
 
     public string DateTimeFormat { get; set; }
 
@@ -64,6 +66,7 @@ internal class Program
         @"Examples: SrumECmd.exe -f ""C:\Temp\SRUDB.dat"" -r ""C:\Temp\SOFTWARE"" --csv ""C:\Temp\"" " + "\r\n\t " +
         @"   SrumECmd.exe -f ""C:\Temp\SRUDB.dat"" --csv ""c:\temp""" + "\r\n\t " +
         @"   SrumECmd.exe -d ""C:\Temp"" --csv ""c:\temp""" + "\r\n\t " +
+        @"   SrumECmd.exe -f ""C:\Temp\SRUDB.dat"" --json ""C:\Temp\out"" --jsonf srum.json" + "\r\n\t " +
         "\r\n\t" +
         "    Short options (single letter) are prefixed with a single dash. Long commands are prefixed with two dashes\r\n";
 
@@ -88,11 +91,36 @@ internal class Program
 
         _args = args;
 
+        try
+        {
+            var exitCode = await CreateRootCommand().Parse(args).InvokeAsync();
+            if (exitCode != 0)
+            {
+                Environment.ExitCode = exitCode;
+            }
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
+    }
+
+    internal static RootCommand CreateRootCommand()
+    {
         var csvOpt = new Option<string>(
             "--csv")
         {
-            Description = "Directory to save CSV formatted results to. Be sure to include the full path in double quotes"
+            Description = "Directory to save CSV formatted results to. This or --json is required"
           //  Required = true
+        };
+
+        var jsonOpt = new Option<string>("--json")
+        {
+            Description = "Directory to save JSON Lines results to. This or --csv is required"
+        };
+        var jsonfOpt = new Option<string>("--jsonf")
+        {
+            Description = "File name to save JSON Lines results to. Overrides the default name; requires --json"
         };
         
         var fOpt = new Option<string>("-f")
@@ -114,7 +142,7 @@ internal class Program
        var dtOpt = new Option<string>(
             "--dt")
         {
-            Description = "The custom date/time format to use when displaying time stamps. See https://goo.gl/CNVq0k for options\r\n",
+            Description = "The custom date/time format for CSV time stamps. JSON dates always use UTC ISO 8601. See https://goo.gl/CNVq0k for options\r\n",
             DefaultValueFactory = _ => "yyyy-MM-dd HH:mm:ss"
         };
 
@@ -135,6 +163,8 @@ internal class Program
            rOpt,
            dOpt,
            csvOpt,
+           jsonOpt,
+           jsonfOpt,
            dtOpt,
            debugOpt,
            traceOpt
@@ -142,15 +172,40 @@ internal class Program
         };
 
         _rootCommand.Description = Header + "\r\n\r\n" + Footer;
-        
-        _rootCommand.SetAction(result => DoWork(result.GetValue(fOpt),result.GetValue(rOpt),result.GetValue(dOpt),result.GetValue(csvOpt),result.GetValue(dtOpt),result.GetValue(debugOpt),result.GetValue(traceOpt)));
 
-        var foo = _rootCommand.Parse(args).InvokeAsync();
+        _rootCommand.Validators.Add(result =>
+        {
+            if (string.IsNullOrWhiteSpace(result.GetValue(fOpt)) &&
+                string.IsNullOrWhiteSpace(result.GetValue(dOpt)))
+            {
+                result.AddError("Either -f or -d is required.");
+            }
 
-        Log.CloseAndFlush();
+            if (string.IsNullOrWhiteSpace(result.GetValue(csvOpt)) &&
+                string.IsNullOrWhiteSpace(result.GetValue(jsonOpt)))
+            {
+                result.AddError("Either --csv or --json is required.");
+            }
+
+            var jsonf = result.GetValue(jsonfOpt);
+            if (jsonf != null)
+            {
+                if (string.IsNullOrWhiteSpace(result.GetValue(jsonOpt)))
+                {
+                    result.AddError("--jsonf requires --json.");
+                }
+                if (!JsonExporter.IsValidFilename(jsonf))
+                {
+                    result.AddError("--jsonf must be a valid filename, not a path.");
+                }
+            }
+        });
+
+        _rootCommand.SetAction(result => DoWork(result.GetValue(fOpt),result.GetValue(rOpt),result.GetValue(dOpt),result.GetValue(csvOpt),result.GetValue(jsonOpt),result.GetValue(jsonfOpt),result.GetValue(dtOpt),result.GetValue(debugOpt),result.GetValue(traceOpt)));
+        return _rootCommand;
     }
 
-    private static void DoWork(string f, string r, string d, string csv, string dt, bool debug, bool trace)
+    private static void DoWork(string f, string r, string d, string csv, string json, string jsonf, string dt, bool debug, bool trace)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -206,10 +261,10 @@ internal class Program
             return;
         }
 
-        if (csv.IsNullOrEmpty())
+        if (csv.IsNullOrEmpty() && json.IsNullOrEmpty())
         {
             var aaa = new CustomHelpAction(new HelpAction());
-            aaa.Invoke(_rootCommand.Parse("--csv is required. Exiting"));
+            aaa.Invoke(_rootCommand.Parse("Either --csv or --json is required. Exiting"));
 
             //Log.Warning("Either -f or -d is required. Exiting");
             return;
@@ -422,6 +477,15 @@ internal class Program
             Log.Information(
                 "If the database is dirty, **make a copy of your files**, ensure all files in the directory are not Read-only, open a PowerShell session as an admin, and repair by using the following commands (change directories to the location of SRUDB.dat first):\r\n\r\n'esentutl.exe /r sru /i'\r\n'esentutl.exe /p SRUDB.dat'\r\n\r\n");
             Environment.Exit(0);
+        }
+
+        if (!string.IsNullOrWhiteSpace(json))
+        {
+            var jsonExitCode = ExportJson(json, jsonf, ts, JsonExporter.GetRecords(sr), f, r);
+            if (jsonExitCode != 0)
+            {
+                Environment.ExitCode = jsonExitCode;
+            }
         }
 
         if (csv.IsNullOrEmpty() == false)
@@ -673,9 +737,34 @@ internal class Program
                 Log.Error(e, "Error exporting 'PushNotification' data! Error: {Message}", e.Message);
             }
 
-            sw.Stop();
+        }
 
-            Log.Information("Processing completed in {TotalSeconds:N4} seconds\r\n", sw.Elapsed.TotalSeconds);
+        sw.Stop();
+        Log.Information("Processing completed in {TotalSeconds:N4} seconds\r\n", sw.Elapsed.TotalSeconds);
+    }
+
+    internal static int ExportJson(string directory, string filename, DateTimeOffset exportTime,
+        IEnumerable<object> records, string databasePath, string hivePath)
+    {
+        try
+        {
+            var outputPath = JsonExporter.GetOutputPath(directory, filename, exportTime);
+            var fullOutputPath = System.IO.Path.GetFullPath(outputPath);
+            if (string.Equals(fullOutputPath, System.IO.Path.GetFullPath(databasePath), StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(hivePath) && string.Equals(fullOutputPath,
+                    System.IO.Path.GetFullPath(hivePath), StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new IOException("JSON output must not overwrite the SRUM database or SOFTWARE hive.");
+            }
+
+            JsonExporter.Write(outputPath, records);
+            Log.Information("JSON Lines output saved to '{JsonFile}'\r\n", outputPath);
+            return 0;
+        }
+        catch (Exception e)
+        {
+            Log.Error(e, "Error exporting JSON data! Error: {Message}", e.Message);
+            return 1;
         }
     }
     

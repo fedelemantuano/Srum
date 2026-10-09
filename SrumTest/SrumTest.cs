@@ -8,6 +8,7 @@ namespace SrumTest;
 public class SrumTest
 {
     [Test]
+    [Explicit("Requires Windows and SRUM evidence at the configured local paths.")]
     public void BuildingAutomation()
     {
         //var r = new Srum(@"D:\OneDrive\HPSpectreSrum\Windows\System32\SRU\SRUDB.dat",@"D:\OneDrive\HPSpectreSrum\Windows\System32\config\SOFTWARE");

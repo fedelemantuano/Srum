@@ -4,7 +4,7 @@ A SRUM parser!
 
 ## Command Line Interface
 
-    SrumECmd version 0.5.0.1
+    SrumECmd version 2026.5.0
 
     Author: Eric Zimmerman (saericzimmerman@gmail.com)
     https://github.com/EricZimmerman/Srum
@@ -13,9 +13,11 @@ A SRUM parser!
             f               SRUDB.dat file to process. Either this or -d is required
             r               SOFTWARE hive to process. This is optional, but recommended
 
-            csv             Directory to save CSV formatted results to. Be sure to include the full path in double quotes
+            csv             Directory to save CSV formatted results to. This or --json is required
+            json            Directory to save JSON Lines results to. This or --csv is required
+            jsonf           File name to save JSON Lines results to. Overrides the default name; requires --json
 
-            dt              The custom date/time format to use when displaying time stamps. Default is: yyyy-MM-dd HH:mm:ss.fffffff
+            dt              The custom date/time format for CSV time stamps. Default is: yyyy-MM-dd HH:mm:ss. JSON dates always use UTC ISO 8601
 
             debug           Show debug information during processing
             trace           Show trace information during processing
@@ -24,6 +26,8 @@ A SRUM parser!
     Examples: SrumECmd.exe -f "C:\Temp\SRUDB.dat" -r "C:\Temp\SOFTWARE" --csv "C:\Temp\"
               SrumECmd.exe -f "C:\Temp\SRUDB.dat" --csv "c:\temp"
               SrumECmd.exe -d "C:\Temp" --csv "c:\temp"
+              SrumECmd.exe -f "C:\Temp\SRUDB.dat" --json "C:\Output" --jsonf srum.json
+              SrumECmd.exe -f "C:\Temp\SRUDB.dat" --csv "C:\Output\csv" --json "C:\Output\json"
 
               Short options (single letter) are prefixed with a single dash. Long commands are prefixed with two dashes
 
@@ -31,7 +35,37 @@ A SRUM parser!
 
 ## Documentation
 
-N/A
+### JSON Lines export
+
+`--json` exports all seven supported SRUM record categories into a single UTF-8 file, without a byte order mark, containing one JSON object per line. The default name is `<UTC yyyyMMddHHmmss>_SrumECmd_Output.json`; `--jsonf` overrides that filename exactly. It accepts a filename, not a path. An existing output file with the same name is replaced. An empty database export creates an empty file.
+
+Each object retains the record's field names and adds `RecordType`, with one of these values: `EnergyUsage`, `TimelineProvider`, `Vfuprov`, `AppResourceUseInfo`, `NetworkConnection`, `NetworkUsage`, or `PushNotification`. Nullable fields belonging to the record are emitted as `null`; numeric and Boolean values retain their JSON types. Enum values are names, and `Duration` is an invariant duration string rather than a timestamp.
+
+All JSON timestamps use UTC ISO 8601 with seven fractional digits and a trailing `Z`, for example `2026-10-09T12:34:56.1234567Z`. This applies to all temporal fields, including `ExeTimestamp` and optional event dates. JSON formatting is independent of `--dt`; CSV output formatting remains unchanged. The JSON export interprets the EnergyUsage timestamp's recorded clock components as UTC, matching the convention of the other SRUM categories without modifying the CSV record.
+
+### Elasticsearch
+
+Map `RecordType` as `keyword` to filter exact category names, and timestamp fields as `date`. The standard `strict_date_optional_time||epoch_millis` date parser accepts the exported strings. Elasticsearch indexes `date` values at millisecond resolution, while the JSON source retains its available fractional precision. See the [export contract and mapping example](docs/design/json-export.md).
+
+For example, filter network usage records with:
+
+```json
+{"query":{"term":{"RecordType":"NetworkUsage"}}}
+```
+
+The output supplies documents for an ingestion pipeline. For Elasticsearch's Bulk API, add an action line before each document. A record's `Id` is local to its source table; it is not a globally unique Elasticsearch document ID.
+
+### Validation
+
+The synthetic JSON export and CLI tests can run with the .NET 9 SDK on Linux, including Docker:
+
+```sh
+dotnet test SrumTest/SrumTest.csproj --configuration Release
+```
+
+Parsing a real SRUDB.dat still requires Windows ESENT. The existing `BuildingAutomation` test is explicit because it requires Windows and evidence files at its configured local paths.
+
+See the [Docker validation report](docs/validation/json-export.md) for reproduction commands, build results, and live Elasticsearch ingestion results.
 
 ## Repairing the SRUDB.dat
 
