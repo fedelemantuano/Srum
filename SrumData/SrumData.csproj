@@ -1,10 +1,10 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <TargetFrameworks>net472;net9.0</TargetFrameworks>
         <LangVersion>10</LangVersion>
         <Authors>Eric R. Zimmerman</Authors>
-        <Description>Parses SRUM databases on Windows</Description>
+        <Description>Parses SRUM databases using ManagedEsent or Dissect</Description>
         <PackageProjectUrl>https://github.com/EricZimmerman/Srum</PackageProjectUrl>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <Version>2026.5.0</Version>
@@ -19,6 +19,7 @@
 
 
     <ItemGroup>
+        <EmbeddedResource Include="python/ese_reader.py" LogicalName="SrumData.ese_reader.py" />
         <PackageReference Include="Microsoft.Database.ManagedEsent" Version="3.2.0" />
         <PackageReference Include="Microsoft.NETCore.Platforms" Version="7.0.4" />
         <PackageReference Include="Microsoft.NETCore.Targets" Version="5.0.0" />

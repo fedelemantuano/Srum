@@ -1,6 +1,6 @@
 # SrumECmd
 
-A SRUM parser!
+A SRUM parser for Windows, Linux, and macOS. The Docker image runs entirely on Linux using Dissect; it does not require a Windows host or VM.
 
 ## Command Line Interface
 
@@ -18,6 +18,8 @@ A SRUM parser!
             jsonf           File name to save JSON Lines results to. Overrides the default name; requires --json
 
             dt              The custom date/time format for CSV time stamps. Default is: yyyy-MM-dd HH:mm:ss. JSON dates always use UTC ISO 8601
+
+            reader          ESE reader: auto (default), esent, or dissect
 
             debug           Show debug information during processing
             trace           Show trace information during processing
@@ -63,55 +65,56 @@ The synthetic JSON export and CLI tests can run with the .NET 9 SDK on Linux, in
 dotnet test SrumTest/SrumTest.csproj --configuration Release
 ```
 
-Parsing a real SRUDB.dat still requires Windows ESENT. The existing `BuildingAutomation` test is explicit because it requires Windows and evidence files at its configured local paths.
+Real SRUDB.dat parsing is available on Linux/macOS with Dissect. The original `BuildingAutomation` test remains explicit because it uses hard-coded Windows evidence paths. Set `SRUM_TEST_SAMPLE_ROOT` to a private directory containing the Clean and Dirty validation fixtures to run the optional integration test.
 
 See the [Docker validation report](docs/validation/json-export.md) for reproduction commands, build results, and live Elasticsearch ingestion results.
 
-## Repairing the SRUDB.dat
+## Docker on macOS and Linux
 
-When you run SrumECmd, you will likely encounter an error message that states the file is dirty. 
+Build the image locally (automatically targets the build's Linux ARM64 or AMD64 architecture):
 
-    Command line: -d M:\Forensics\SrumECmdTest\tout -k --csv M:\Forensics\SrumECmdTest\mout\SystemActivity
-    Found SRUM database file 'M:\Forensics\SrumECmdTest\tout\C\Windows\System32\SRU\SRUDB.dat'!
-    Found SOFTWARE hive 'M:\Forensics\SrumECmdTest\tout\C\Windows\System32\config\software'!
-    Processing 'M:\Forensics\SrumECmdTest\tout\C\Windows\System32\SRU\SRUDB.dat'...
-    Error processing file! Message: Object reference not set to an instance of an object..
-    This almost always means the database is dirty and must be repaired. This can be verified by running 'esentutl.exe /mh SRUDB.dat' and examining the 'State' property
-    If the database is dirty, **make a copy of your files**, ensure all files in the directory are not Read-only, open a PowerShell session as an admin, and repair by using the following commands (change directories to the location of SRUDB.dat first):
-    'esentutl.exe /r sru /i'
-    'esentutl.exe /p SRUDB.dat'
-    Executed 1 processor in 0.9046 seconds
+```sh
+docker build -t srumecmd:local .
+mkdir -p output/Clean output/Dirty
+for sample in Clean Dirty; do
+  docker run --rm --network none --read-only \
+    --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,noexec,nosuid,size=128m \
+    -v "/absolute/path/BelkasoftCTF_InsiderThreat/$sample:/evidence:ro" \
+    -v "$PWD/output/$sample:/out" \
+    srumecmd:local -d /evidence --json /out --jsonf srum.json --csv /out
+  status=$?
+  echo "$sample exit status: $status"
+done
+```
 
-    Total execution time: 6.5490 seconds
-    
-Follow these steps to repair the `SRUDB.dat` so you can run SrumECmd.exe again. First, follow the steps SrumECmd provides:
-1. Make a copy of the files within the `.\SRU` directory
+Run this loop in a shell without `set -e`, or handle exit 2 explicitly in your calling application. Replace the absolute evidence path. Each invocation processes one database; `-d` rejects ambiguous directories containing multiple SRUDB.dat files. Use `-r /path/to/SOFTWARE` for optional registry enrichment. Without a hive, application/SID mappings stored in SRUDB.dat are still used.
 
-2. Ensure the `.\SRU` directory itself is not Read Only. This can be done by right clicking on the directory itself, Properties, and unchecking Read Only if it is checked:
+The image includes .NET and pinned Python dependencies and runs as UID/GID 65532 by default. The output volume must be writable by the selected user. Input can remain read-only, and no runtime network access is required. For execution outside Docker, install Python >=3.10 and `SrumData/python/requirements.txt`; `SRUM_PYTHON` selects the interpreter.
 
-![SRUFolderReadOnlyExample](Pictures/SRUFolderReadOnlyExample.gif)
+### Processing status
 
-3. Open a PowerShell session as an Administrator in the directory where your copied files reside
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Supported tables were parsed and outputs written without incompleteness detected. |
+| 1 | Input, helper, schema, or output failure. Do not treat existing outputs from a previous run as new results. |
+| 2 | Output written, but the ESE state is not clean or some rows failed to decode. Inspect diagnostics before ingestion. |
 
-4. Execute this command within the PowerShell Admin session: 
+JSON export also writes `<json-filename>.diagnostics.json` in the output directory. CSV-only mode writes `<timestamp>_SrumECmd.diagnostics.json`. This report includes reader, ESE state, input SHA-256, log replay capability, record/table counts, missing optional tables, and bounded row-error details. Optional tables may be absent legitimately. A missing required ID mapping table or incompatible schema is fatal. Individual malformed rows are counted and reported while other readable rows continue.
 
-    `esentutl.exe /r sru /i`
+**Dissect reads database pages; it does not replay transaction logs.** A dirty SRUDB.dat can still yield useful records, but these may be incomplete or inconsistent. Supplying SRU.log, numbered logs, or SRU.chk does not change this. Clean and dirty files can produce identical page-level exports; that does not demonstrate transaction-level completeness. This implementation parses the seven supported activity categories; it is not deleted-record carving or a generic dump of every ESE system table.
 
-![SRUDBFirstRepairCommand](Pictures/SRUDBFirstRepairCommand.gif)
+The Windows `esent` reader remains available for existing users. Linux containers never invoke `esent.dll`, a Windows VM, or lossy `esentutl /p` repair. JSON timestamp and CSV field conventions are unchanged.
 
-5. Execute this command within the PowerShell Admin session: 
+### Kubernetes
 
-    `esentutl.exe /p SRUDB.dat`
-    
-![SRUDBSecondRepairCommand](Pictures/SRUDBSecondRepairCommand.gif)
+Use [deploy/kubernetes-job.yaml](deploy/kubernetes-job.yaml) as a Job template: choose your image reference, existing input/output PVCs, evidence directory and a unique output directory for each database. It uses Linux nodes, a non-root process, read-only evidence/root filesystem, no service-account token, and a writable temporary volume. Size memory limits for your evidence: decoded SRUM records are retained in memory before export.
 
-6. Try running SrumECmd again against the location where these repaired files reside:
+Exit 2 is deliberately nonzero. Kubernetes marks such a Job as failed even though results were produced; the orchestration layer should distinguish `2` (results requiring review) from `1` (failure), retain the output PVC, and read the diagnostic report. `backoffLimit: 0` prevents automatic retry loops on dirty evidence. The template does not provide a cluster-specific NetworkPolicy; add an egress policy if your deployment requires enforced network isolation. See the [Kubernetes Job documentation](https://kubernetes.io/docs/concepts/workloads/controllers/job/).
 
-![SrumECmdParsingSuccessExample](Pictures/SrumECmdParsingSuccessExample.png)
+To build for both Linux architectures for a registry, use `docker buildx build --platform linux/amd64,linux/arm64 -t YOUR_REGISTRY/srumecmd:VERSION --push .`. Publishing and deployment are separate from local validation.
 
-7. Examine output in Timeline Explorer!
-
-![SrumECmdCSVOutput](Pictures/SrumECmdCSVOutput.jpg)
+See [real-sample Docker validation](docs/validation/linux-docker.md) for the tested files and results.
 
 # Download Eric Zimmerman's Tools
 

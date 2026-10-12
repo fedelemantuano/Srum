@@ -1,0 +1,57 @@
+# Replace the registry/image tag and the two existing PVC names before applying.
+# Submit one Job per evidence directory and choose a distinct output directory.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: srum-clean
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 2100
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: parser
+          image: registry.example.com/forensics/srumecmd:VERSION
+          args: ["-d", "/evidence/Clean", "--reader", "dissect", "--json", "/out/Clean", "--jsonf", "srum.json"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          volumeMounts:
+            - name: evidence
+              mountPath: /evidence
+              readOnly: true
+            - name: results
+              mountPath: /out
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: evidence
+          persistentVolumeClaim:
+            claimName: srum-evidence
+            readOnly: true
+        - name: results
+          persistentVolumeClaim:
+            claimName: srum-results
+        - name: temporary
+          emptyDir:
+            sizeLimit: "128Mi"

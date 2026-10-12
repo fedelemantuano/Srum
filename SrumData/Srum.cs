@@ -1,4 +1,6 @@
-﻿using System;
+using System.Runtime.InteropServices;
+using SrumData.Readers;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
@@ -1088,8 +1090,24 @@ public class Srum
     public readonly Dictionary<int, Vfuprov> Vfuprovs;
     public readonly Dictionary<int, UserInfo> UserMaps;
 
-    public Srum(string fileName, string softwareHive)
+    public EseReaderKind ReaderKind { get; }
+    public int DatabaseState { get; private set; }
+    public bool HasIncompleteData => (ReaderKind == EseReaderKind.Dissect && DatabaseState != 3) || ParsingErrorCount > 0;
+    public int ParsingErrorCount { get; private set; }
+    public List<string> ParsingErrors { get; } = new();
+    public List<string> MissingTables { get; } = new();
+    public Dictionary<string, int> RowsRead { get; } = new();
+    public Dictionary<string, int> RowsParsed { get; } = new();
+    private int _lastEnergyId;
+
+    public Srum(string fileName, string softwareHive) : this(fileName, softwareHive, EseReaderKind.Auto) { }
+
+    public Srum(string fileName, string softwareHive, EseReaderKind readerKind)
+        : this(fileName, softwareHive, CreateReader(readerKind), ResolveReader(readerKind)) { }
+
+    internal Srum(string fileName, string softwareHive, IEseReader reader, EseReaderKind readerKind)
     {
+        ReaderKind = readerKind;
         if (File.Exists(fileName) == false)
         {
             throw new FileNotFoundException($"{fileName} does not exist!");
@@ -1109,6 +1127,7 @@ public class Srum
             var reg = new RegistryHiveOnDemand(softwareHive);
             var k = reg.GetKey(@"Microsoft\Windows NT\CurrentVersion\ProfileList");
 
+            if (k != null)
             foreach (var registryKey in k.SubKeys)
             {
                 var kd = reg.GetKey(registryKey.KeyPath);
@@ -1116,7 +1135,7 @@ public class Srum
                 var v = kd.Values.SingleOrDefault(t => t.ValueName == "ProfileImagePath");
                 if (v != null)
                 {
-                    SidToUser.Add(registryKey.KeyName, Path.GetFileName(v.ValueData));
+                    SidToUser.Add(registryKey.KeyName, v.ValueData.TrimEnd('\\').Split('\\').Last());
                 }
             }
 
@@ -1170,24 +1189,6 @@ public class Srum
         Log.Debug("Processing {Hive} Registry hive","SOFTWARE");
 
 
-        Log.Debug("Initiating instance");
-        using var instance = new Instance("pulldata");
-        instance.Parameters.LogFileDirectory = Path.GetDirectoryName(fileName);
-        instance.Parameters.SystemDirectory = Path.GetDirectoryName(fileName);
-        instance.Parameters.BaseName = "SRU";
-        instance.Parameters.TempDirectory = Path.GetDirectoryName(fileName);
-        instance.Parameters.EnableIndexCleanup = true;
-
-        //instance.Parameters.Recovery = false;            
-
-        instance.Init();
-
-        Log.Debug("Setting up session");
-        using var session = new Session(instance);
-        Api.JetAttachDatabase(session, fileName, AttachDatabaseGrbit.DeleteCorruptIndexes);
-        Api.JetOpenDatabase(session, fileName, null, out var dbid, OpenDatabaseGrbit.ReadOnly);
-
-        Log.Debug("Initiating dictionaries");
         AppMaps = new Dictionary<int, AppInfo>();
         UserMaps = new Dictionary<int, UserInfo>();
         NetworkUsages = new Dictionary<int, NetworkUsage>();
@@ -1198,519 +1199,447 @@ public class Srum
         Vfuprovs = new Dictionary<int, Vfuprov>();
         TimelineProviders = new Dictionary<int, TimelineProvider>();
 
-        Log.Debug("Building ID Maps");
-        BuildIdMap(session, dbid);
+        var handlers = new Dictionary<string, Action<EseRecord>>
+        {
+            ["SruDbIdMapTable"] = BuildIdMap,
+            ["{973F5D5C-1D90-4944-BE8E-24B94231A174}"] = GetNetworkUsageInfo,
+            ["{D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}"] = GetApplicationResourceUsage,
+            ["{DD6636C4-8929-4683-974E-22C046A43763}"] = GetNetworkConnections,
+            ["{D10CA2FE-6FCF-4F6D-848E-B2E99266FA86}"] = GetPushNotifications,
+            ["{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT"] = GetEnergyUsagesLt,
+            ["{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}"] = GetEnergyUsages,
+            ["{7ACBBAA3-D029-4BE4-9A7A-0885927F1D8F}"] = GetVfuprovs,
+            ["{5C8CF1C7-7257-4F13-B223-970EF5939312}"] = GetAppTimelines,
+        };
+        // ID mappings must precede activity tables; energy LT precedes non-LT for legacy IDs.
+        foreach (var record in reader.ReadDatabase(fileName, new[]
+        {
+            "SruDbIdMapTable", NetworkUsage.TableName, AppResourceUseInfo.TableName,
+            NetworkConnection.TableName, PushNotification.TableName,
+            "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT", "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}",
+            Vfuprov.TableName, TimelineProvider.TableName
+        }))
+        {
+            switch (record.Kind)
+            {
+                case "database":
+                    DatabaseState = record.State;
+                    if (ReaderKind == EseReaderKind.Dissect && DatabaseState != 3)
+                        Log.Warning("ESE state {State}: exported pages may be incomplete/inconsistent. Dissect does not replay transaction logs.", DatabaseState);
+                    break;
+                case "missing":
+                    if (record.Table == "SruDbIdMapTable")
+                        throw new InvalidDataException("Missing required SruDbIdMapTable.");
+                    MissingTables.Add(record.Table);
+                    Log.Information("Optional SRUM table is absent: {Table}", record.Table);
+                    break;
+                case "table":
+                    ValidateSchema(record);
+                    RowsRead.Add(record.Table, 0);
+                    RowsParsed.Add(record.Table, 0);
+                    break;
+                case "row":
+                    RowsRead[record.Table]++;
+                    try
+                    {
+                        handlers[record.Table](record);
+                        RowsParsed[record.Table]++;
+                    }
+                    catch (Exception e) when (e is InvalidDataException || e is ArgumentException ||
+                        e is KeyNotFoundException || e is OverflowException || e is FormatException)
+                    {
+                        // Preserve other readable rows; bounded diagnostics contain no evidence values.
+                        ParsingErrorCount++;
+                        if (ParsingErrors.Count < 100)
+                            ParsingErrors.Add(record.Table + " row " + RowsRead[record.Table] + ": " + e.GetType().Name);
+                    }
+                    break;
+            }
+        }
+        if (ParsingErrorCount > 0)
+            Log.Warning("{Count} SRUM rows could not be mapped. The export is incomplete.", ParsingErrorCount);
+    }
 
-        Log.Debug("Getting {Thing}","NetworkUsageInfo");
-        try
-        {
-            GetNetworkUsageInfo(session, dbid);
-        }
-        catch (Exception e)
-        {
-            Log.Warning(e,"Error processing Network Usage info ({TableName}): {Message}",NetworkUsage.TableName,e.Message);
-        }
+    private static EseReaderKind ResolveReader(EseReaderKind kind) => kind == EseReaderKind.Auto
+        ? (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? EseReaderKind.Esent : EseReaderKind.Dissect) : kind;
 
-        Log.Debug("Getting {Thing}","ApplicationResourceUsage");
-        
-        try
+    internal static IEseReader CreateReader(EseReaderKind kind)
+    {
+        switch (ResolveReader(kind))
         {
-            GetApplicationResourceUsage(session, dbid);
-        }
-        catch (Exception e)
-        {
-            Log.Warning(e,"Error processing App Resource Use info ({TableName}): {Message}",AppResourceUseInfo.TableName,e.Message);
-        }
-
-        Log.Debug("Getting {Thing}","NetworkConnections");
-        try
-        {
-            GetNetworkConnections(session, dbid);
-        }
-        catch (Exception e)
-        {
-            Log.Warning(e,"Error processing Network Connection info ({TableName}): {Message}",NetworkConnection.TableName,e.Message);
-        }
-
-        Log.Debug("Getting {Thing}","PushNotifications");
-        try
-        {
-            GetPushNotifications(session, dbid);
-        }
-        catch (Exception e)
-        {
-            Log.Warning(e,"Error processing Push Notification info ({TableName}): {Message}",PushNotification.TableName,e.Message);
-        }
-
-        Log.Debug("Getting {Thing}","EnergyUsages (and LT)");
-        try
-        {
-            GetEnergyUsages(session, dbid);
-        }
-        catch (Exception e)
-        {
-            Log.Warning(e,"Error processing Energy Usage info ({TableName}): {Message}",EnergyUsage.TableName,e.Message);
-        }
-
-        Log.Debug("Getting {Thing}","vfuprov");
-        try
-        {
-            GetVfuprovs(session, dbid);
-        }
-        catch (Exception e)
-        {
-            Log.Warning(e,"Error processing Vfuprov info ({TableName}): {Message}",Vfuprov.TableName,e.Message);
-        }
-
-        Log.Debug("Getting {Thing}","Timeline Provider");
-        try
-        {
-            GetAppTimelines(session, dbid);
-        }
-        catch (Exception e)
-        {
-            Log.Warning(e,"Error processing Timeline Provider info ({TableName}): {Message}",TimelineProvider.TableName,e.Message);
+            case EseReaderKind.Dissect: return new DissectReader();
+            case EseReaderKind.Esent:
+                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    throw new PlatformNotSupportedException("--reader esent requires Windows; use --reader dissect on Linux/macOS.");
+                return new ManagedEsentReader();
+            default: throw new ArgumentOutOfRangeException(nameof(kind));
         }
     }
 
-    /// <summary>
-    ///     {7ACBBAA3-D029-4BE4-9A7A-0885927F1D8F}
-    /// </summary>
-    /// <param name="session"></param>
-    /// <param name="dbid"></param>
-    private void GetVfuprovs(Session session, JET_DBID dbid)
+    private static readonly Dictionary<string, string[]> RequiredColumns = new()
     {
-        using var pushTable
-            = new Table(session, dbid, "{7ACBBAA3-D029-4BE4-9A7A-0885927F1D8F}", OpenTableGrbit.ReadOnly);
+        ["SruDbIdMapTable"] = new[] { "IdType", "IdIndex", "IdBlob" },
+        ["{973F5D5C-1D90-4944-BE8E-24B94231A174}"] = new[] { "AutoIncId", "AppId", "UserId", "BytesRecvd", "BytesSent", "InterfaceLuid", "L2ProfileFlags", "L2ProfileId", "TimeStamp" },
+        ["{D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}"] = new[] { "AutoIncId", "AppId", "UserId", "TimeStamp", "BackgroundBytesRead", "BackgroundBytesWritten", "BackgroundCycleTime", "ForegroundBytesRead", "ForegroundBytesWritten", "ForegroundCycleTime", "FaceTime", "BackgroundContextSwitches", "BackgroundNumberOfFlushes", "BackgroundNumReadOperations", "BackgroundNumWriteOperations", "ForegroundContextSwitches", "ForegroundNumberOfFlushes", "ForegroundNumReadOperations", "ForegroundNumWriteOperations" },
+        ["{DD6636C4-8929-4683-974E-22C046A43763}"] = new[] { "AutoIncId", "AppId", "UserId", "InterfaceLuid", "L2ProfileFlags", "L2ProfileId", "TimeStamp", "ConnectedTime", "ConnectStartTime" },
+        ["{D10CA2FE-6FCF-4F6D-848E-B2E99266FA86}"] = new[] { "AutoIncId", "AppId", "UserId", "NetworkType", "NotificationType", "PayloadSize", "TimeStamp" },
+        ["{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT"] = new[] { "AutoIncId", "AppId", "UserId", "TimeStamp", "DesignedCapacity", "FullChargedCapacity", "CycleCount", "ActiveAcTime", "ActiveDcTime", "ActiveDischargeTime", "ActiveEnergy", "CsAcTime", "CsDcTime", "CsDischargeTime", "CsEnergy", "ConfigurationHash" },
+        ["{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}"] = new[] { "AutoIncId", "AppId", "UserId", "TimeStamp", "DesignedCapacity", "FullChargedCapacity", "StateTransition", "CycleCount", "ChargeLevel", "EventTimestamp", "ConfigurationHash" },
+        ["{7ACBBAA3-D029-4BE4-9A7A-0885927F1D8F}"] = new[] { "AutoIncId", "AppId", "UserId", "Flags", "EndTime", "StartTime", "TimeStamp" },
+        ["{5C8CF1C7-7257-4F13-B223-970EF5939312}"] = new[] { "AutoIncId", "AppId", "UserId", "DurationMS", "EndTime", "TimeStamp" },
+    };
 
-        Api.JetSetTableSequential(session, pushTable, SetTableSequentialGrbit.None);
-        Api.MoveBeforeFirst(session, pushTable);
-
-        while (Api.TryMoveNext(session, pushTable))
-        {
-            var id = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AutoIncId"));
-            var appId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AppId"));
-            var userId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "UserId"));
-
-            var flags = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "Flags"));
-
-            var endTime = Api.RetrieveColumnAsInt64(session, pushTable, Api.GetTableColumnid(session, pushTable, "EndTime"));
-            var startTime = Api.RetrieveColumnAsInt64(session, pushTable, Api.GetTableColumnid(session, pushTable, "StartTime"));
-
-            var dt = Api.RetrieveColumnAsDateTime(session, pushTable, Api.GetTableColumnid(session, pushTable, "TimeStamp"));
-
-            var pu = new Vfuprov(id.Value, dt.Value, userId.Value, appId.Value, flags.Value, startTime.Value, endTime.Value);
-
-            pu.ExeInfo = AppMaps[appId.Value].ExeInfo;
-            pu.ExeInfoDescription = AppMaps[appId.Value].ExeInfoDescription;
-            pu.ExeTimestamp = AppMaps[appId.Value].Timestamp;
-            pu.Sid = UserMaps[userId.Value].Sid;
-            pu.SidType = UserMaps[userId.Value].SidType;
-            pu.UserName = UserMaps[userId.Value].UserName;
-
-            Vfuprovs.Add(pu.Id, pu);
-        }
-
-        Api.JetResetTableSequential(session, pushTable
-            , ResetTableSequentialGrbit.None);
-    }
-
-    /// <summary>
-    ///     {5C8CF1C7-7257-4F13-B223-970EF5939312}
-    /// </summary>
-    /// <param name="session"></param>
-    /// <param name="dbid"></param>
-    private void GetAppTimelines(Session session, JET_DBID dbid)
+    private static readonly HashSet<string> Int64Columns = new()
     {
-        using var pushTable
-            = new Table(session, dbid, "{5C8CF1C7-7257-4F13-B223-970EF5939312}", OpenTableGrbit.ReadOnly);
+        "BytesRecvd", "BytesSent", "InterfaceLuid", "BackgroundBytesRead", "BackgroundBytesWritten", "BackgroundCycleTime", "ForegroundBytesRead", "ForegroundBytesWritten", "ForegroundCycleTime", "FaceTime", "ConnectStartTime", "ConfigurationHash", "EventTimestamp", "EndTime", "StartTime"
+    };
 
-        Api.JetSetTableSequential(session, pushTable, SetTableSequentialGrbit.None);
-        Api.MoveBeforeFirst(session, pushTable);
-
-        while (Api.TryMoveNext(session, pushTable))
+    private static void ValidateSchema(EseRecord record)
+    {
+        foreach (var column in RequiredColumns[record.Table])
         {
-            var id = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AutoIncId"));
-            var appId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AppId"));
-            var userId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "UserId"));
-
-            var dur = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "DurationMS"));
-
-            var endTime = Api.RetrieveColumnAsInt64(session, pushTable, Api.GetTableColumnid(session, pushTable, "EndTime"));
-
-            var dt = Api.RetrieveColumnAsDateTime(session, pushTable, Api.GetTableColumnid(session, pushTable, "TimeStamp"));
-
-            var pu = new TimelineProvider(id.Value, dt.Value, userId.Value, appId.Value, dur.Value, endTime.Value);
-
-            pu.ExeInfo = AppMaps[appId.Value].ExeInfo;
-            pu.ExeInfoDescription = AppMaps[appId.Value].ExeInfoDescription;
-            pu.ExeTimestamp = AppMaps[appId.Value].Timestamp;
-            pu.Sid = UserMaps[userId.Value].Sid;
-            pu.SidType = UserMaps[userId.Value].SidType;
-            pu.UserName = UserMaps[userId.Value].UserName;
-
-            TimelineProviders.Add(pu.Id, pu);
+            if (record.Columns == null || !record.Columns.TryGetValue(column, out var actual))
+                throw new InvalidDataException("Missing required column " + record.Table + "." + column);
+            actual = actual?.Replace(" ", "").ToLowerInvariant();
+            var valid = column == "TimeStamp" ? actual == "datetime" :
+                column == "IdBlob" ? actual == "binary" || actual == "longbinary" :
+                column == "IdType" ? actual == "unsignedbyte" :
+                Int64Columns.Contains(column) ? actual == "longlong" || actual == "signedlonglong" :
+                actual == "long" || actual == "signedlong";
+            if (!valid) throw new InvalidDataException("Unsupported ESE column type for " + record.Table + "." + column);
         }
-
-        Api.JetResetTableSequential(session, pushTable
-            , ResetTableSequentialGrbit.None);
     }
 
     public static void DumpTableInfo(string fileName)
     {
-        if (File.Exists(fileName) == false)
+        foreach (var record in CreateReader(EseReaderKind.Auto).ReadDatabase(fileName, null))
         {
-            throw new FileNotFoundException($"{fileName} does not exist!");
-        }
-
-        using var instance = new Instance("pulldata");
-        instance.Parameters.Recovery = false;
-
-        instance.Init();
-
-        using var session = new Session(instance);
-        Api.JetAttachDatabase(session, fileName, AttachDatabaseGrbit.ReadOnly);
-        Api.JetOpenDatabase(session, fileName, null, out var dbid, OpenDatabaseGrbit.ReadOnly);
-
-        foreach (var table in Api.GetTableNames(session, dbid))
-        {
-            Log.Information("TABLE: {Table}",table);
-
-            foreach (var column in Api.GetTableColumns(session, dbid, table))
-            {
-                Log.Information("\t{Name}: {ColumnType}", column.Name, column.Coltyp);
-            }
-
-            Log.Information("------------------------------------");
+            if (record.Kind != "table") continue;
+            Log.Information("TABLE: {Table}", record.Table);
+            foreach (var column in record.Columns)
+                Log.Information("\t{Name}: {ColumnType}", column.Key, column.Value);
         }
     }
 
-    /// <summary>
-    ///     {FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT and {FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}
-    /// </summary>
-    /// <param name="session"></param>
-    /// <param name="dbid"></param>
-    private void GetEnergyUsages(Session session, JET_DBID dbid)
+    private void BuildIdMap(EseRecord row)
     {
-        using var pushTable
-            = new Table(session, dbid, "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT", OpenTableGrbit.ReadOnly);
+        var idType = row.Byte("IdType");
+        var index = row.Int32("IdIndex");
+        var blob = row.Bytes("IdBlob");
 
-        Api.JetSetTableSequential(session, pushTable, SetTableSequentialGrbit.None);
-        Api.MoveBeforeFirst(session, pushTable);
+        var outVal = string.Empty;
+        var userName = string.Empty;
 
-
-        var lastSeen = 0;
-        while (Api.TryMoveNext(session, pushTable))
+        switch (idType)
         {
-            // TABLE: {FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT
-            // ActiveAcTime: Long
-            // ActiveDcTime: Long
-            // ActiveDischargeTime: Long
-            // ActiveEnergy: Long
-            // AppId: Long
-            // AutoIncId: Long
-            // ConfigurationHash: LongLong
-            // CsAcTime: Long
-            // CsDcTime: Long
-            // CsDischargeTime: Long
-            // CsEnergy: Long
-            // CycleCount: Long
-            // DesignedCapacity: Long
-            // FullChargedCapacity: Long
-            // TimeStamp: DateTime
-            // UserId: Long
-
-
-            var id = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AutoIncId"));
-            var appId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AppId"));
-            var userId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "UserId"));
-
-            var dt = Api.RetrieveColumnAsDateTime(session, pushTable, Api.GetTableColumnid(session, pushTable, "TimeStamp"));
-
-            var designedCapacity = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "DesignedCapacity"));
-            var fullChargedCapacity = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "FullChargedCapacity"));
-
-            var cycleCount = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "CycleCount"));
-
-
-            var activeAcTime = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "ActiveAcTime"));
-            var activeDcTime = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "ActiveDcTime"));
-            var activeDischargeTime = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "ActiveDischargeTime"));
-            var activeEnergy = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "ActiveEnergy"));
-            var csAcTime = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "CsAcTime"));
-            var csDcTime = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "CsDcTime"));
-            var csDischargeTime = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "CsDischargeTime"));
-            var csEnergy = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "CsEnergy"));
-
-
-            var configurationHash = Api.RetrieveColumnAsInt64(session, pushTable, Api.GetTableColumnid(session, pushTable, "ConfigurationHash"));
-
-            var pu = new EnergyUsage(id.Value, true, dt.Value, userId.Value, appId.Value, configurationHash.Value, -1, -1, -1, cycleCount.Value, designedCapacity.Value, fullChargedCapacity.Value, activeAcTime.Value, activeDcTime.Value, activeDischargeTime.Value, activeEnergy.Value, csAcTime.Value, csDcTime.Value, csDischargeTime.Value, csEnergy.Value);
-
-            EnergyUsages.Add(pu.Id, pu);
-
-            lastSeen = pu.Id;
-        }
-
-        Api.JetResetTableSequential(session, pushTable
-            , ResetTableSequentialGrbit.None);
-
-        using var pushTable2
-            = new Table(session, dbid, "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}", OpenTableGrbit.ReadOnly);
-
-        Api.JetSetTableSequential(session, pushTable2, SetTableSequentialGrbit.None);
-        Api.MoveBeforeFirst(session, pushTable2);
-
-        while (Api.TryMoveNext(session, pushTable2))
-        {
-            // TABLE: {FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}
-            // AppId: Long
-            // AutoIncId: Long
-            // ChargeLevel: Long
-            // ConfigurationHash: LongLong
-            // CycleCount: Long
-            // DesignedCapacity: Long
-            // EventTimestamp: LongLong
-            // FullChargedCapacity: Long
-            // StateTransition: Long
-            // TimeStamp: DateTime
-            // UserId: Long
-
-
-            var id = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "AutoIncId"));
-            var appId = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "AppId"));
-            var userId = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "UserId"));
-
-            var dt = Api.RetrieveColumnAsDateTime(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "TimeStamp"));
-
-            var designedCapacity = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "DesignedCapacity"));
-            var fullChargedCapacity = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "FullChargedCapacity"));
-            var stateTransition = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "StateTransition"));
-            var cycleCount = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "CycleCount"));
-            var chargeLevel = Api.RetrieveColumnAsInt32(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "ChargeLevel"));
-
-            var eventTimestamp = Api.RetrieveColumnAsInt64(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "EventTimestamp"));
-            var configurationHash = Api.RetrieveColumnAsInt64(session, pushTable2, Api.GetTableColumnid(session, pushTable2, "ConfigurationHash"));
-
-            var pu = new EnergyUsage(id.Value, false, dt.Value, userId.Value, appId.Value, configurationHash.Value, eventTimestamp.Value, stateTransition.Value, chargeLevel.Value, cycleCount.Value, designedCapacity.Value, fullChargedCapacity.Value, -1, -1, -1, -1, -1, -1, -1, -1);
-
-            if (EnergyUsages.ContainsKey(pu.Id))
-            {
-                while (EnergyUsages.ContainsKey(lastSeen))
+            case 0:
+            case 1:
+            case 2:
+                if (blob != null)
                 {
-                    lastSeen += 1;
+                    outVal = Encoding.Unicode.GetString(blob).Trim('\0');
                 }
 
-                
-                Log.Warning("Id {Id} in use from LT table. Incrementing by {LastSeen}",pu.Id,lastSeen);
-                pu.Id += lastSeen;
-            }
 
-            EnergyUsages.Add(pu.Id, pu);
+                var app = new AppInfo(index, (MapType)idType, outVal);
+
+                AppMaps.Add(app.Index, app);
+
+                break;
+
+            case 3:
+                outVal = ConvertHexStringToSidString(blob);
+
+                if (SidToUser.ContainsKey(outVal))
+                {
+                    userName = SidToUser[outVal];
+                }
+
+
+                var user = new UserInfo(index, outVal, userName);
+
+                UserMaps.Add(user.Index, user);
+
+                break;
         }
-
-        Api.JetResetTableSequential(session, pushTable2
-            , ResetTableSequentialGrbit.None);
     }
 
-    /// <summary>
-    ///     {D10CA2FE-6FCF-4F6D-848E-B2E99266FA86}
-    /// </summary>
-    /// <param name="session"></param>
-    /// <param name="dbid"></param>
-    private void GetPushNotifications(Session session, JET_DBID dbid)
+    private void GetNetworkUsageInfo(EseRecord row)
     {
-        using var pushTable
-            = new Table(session, dbid, "{D10CA2FE-6FCF-4F6D-848E-B2E99266FA86}", OpenTableGrbit.ReadOnly);
+        var id = row.Int32("AutoIncId");
+        var appId = row.Int32("AppId");
+        var userId = row.Int32("UserId");
+        var br = row.Int64("BytesRecvd");
+        var bs = row.Int64("BytesSent");
+        var iL = row.Int64("InterfaceLuid");
+        var pf = row.Int32("L2ProfileFlags");
+        var pId = row.Int32("L2ProfileId");
+        var dt = row.DateTime("TimeStamp");
 
-        Api.JetSetTableSequential(session, pushTable, SetTableSequentialGrbit.None);
-        Api.MoveBeforeFirst(session, pushTable);
-
-        while (Api.TryMoveNext(session, pushTable))
+        var profile = string.Empty;
+        if (ProfileIndexToSsid.ContainsKey(pId))
         {
-            var id = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AutoIncId"));
-            var appId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "AppId"));
-            var userId = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "UserId"));
-            var nT = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "NetworkType"));
-            var notT = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "NotificationType"));
-            var ps = Api.RetrieveColumnAsInt32(session, pushTable, Api.GetTableColumnid(session, pushTable, "PayloadSize"));
-            var dt = Api.RetrieveColumnAsDateTime(session, pushTable, Api.GetTableColumnid(session, pushTable, "TimeStamp"));
-
-            var pu = new PushNotification(id.Value, dt.Value, nT.Value, notT.Value, ps.Value, userId.Value, appId.Value);
-
-            pu.ExeInfo = AppMaps[appId.Value].ExeInfo;
-            pu.ExeInfoDescription = AppMaps[appId.Value].ExeInfoDescription;
-            pu.ExeTimestamp = AppMaps[appId.Value].Timestamp;
-            pu.Sid = UserMaps[userId.Value].Sid;
-            pu.SidType = UserMaps[userId.Value].SidType;
-            pu.UserName = UserMaps[userId.Value].UserName;
-
-            PushNotifications.Add(pu.Id, pu);
+            profile = ProfileIndexToSsid[pId];
         }
 
-        Api.JetResetTableSequential(session, pushTable
-            , ResetTableSequentialGrbit.None);
+        var nu = new NetworkUsage(id, dt, appId, userId, br, bs, iL, pf, pId, profile);
+
+        nu.ExeInfo = AppMaps[appId].ExeInfo;
+        nu.ExeInfoDescription = AppMaps[appId].ExeInfoDescription;
+        nu.ExeTimestamp = AppMaps[appId].Timestamp;
+        nu.Sid = UserMaps[userId].Sid;
+        nu.SidType = UserMaps[userId].SidType;
+        nu.UserName = UserMaps[userId].UserName;
+
+
+        NetworkUsages.Add(nu.Id, nu);
     }
 
-    /// <summary>
-    ///     {DD6636C4-8929-4683-974E-22C046A43763}
-    /// </summary>
-    /// <param name="session"></param>
-    /// <param name="dbid"></param>
-    private void GetNetworkConnections(Session session, JET_DBID dbid)
+    private void GetApplicationResourceUsage(EseRecord row)
     {
-        using var networkUsageTable = new Table(session, dbid, "{DD6636C4-8929-4683-974E-22C046A43763}", OpenTableGrbit.ReadOnly);
+        var id = row.Int32("AutoIncId");
 
-        Api.JetSetTableSequential(session, networkUsageTable, SetTableSequentialGrbit.None);
+        var appId = row.Int32("AppId");
 
-        Api.MoveBeforeFirst(session, networkUsageTable);
+        var userId = row.Int32("UserId");
 
-        while (Api.TryMoveNext(session, networkUsageTable))
+        var dt = row.DateTime("TimeStamp");
+
+        var bbr = row.Int64("BackgroundBytesRead");
+        var bbw = row.Int64("BackgroundBytesWritten");
+        var bct = row.Int64("BackgroundCycleTime");
+        var fbr = row.Int64("ForegroundBytesRead");
+        var fbw = row.Int64("ForegroundBytesWritten");
+        var fct = row.Int64("ForegroundCycleTime");
+        var ft = row.Int64("FaceTime");
+
+
+        var bcs = row.Int32("BackgroundContextSwitches");
+        var bnf = row.Int32("BackgroundNumberOfFlushes");
+        var bro = row.Int32("BackgroundNumReadOperations");
+        var bwo = row.Int32("BackgroundNumWriteOperations");
+
+        var fcs = row.Int32("ForegroundContextSwitches");
+        var fnf = row.Int32("ForegroundNumberOfFlushes");
+        var fro = row.Int32("ForegroundNumReadOperations");
+        var fwo = row.Int32("ForegroundNumWriteOperations");
+
+        var ari = new AppResourceUseInfo(id, dt, appId, userId, bbr, bbw, bct, ft, fbr, fbw, fct, bcs, bnf, bro, bwo, fcs, fnf, fro,
+            fwo);
+
+        ari.ExeInfo = AppMaps[appId].ExeInfo;
+        ari.ExeInfoDescription = AppMaps[appId].ExeInfoDescription;
+        ari.ExeTimestamp = AppMaps[appId].Timestamp;
+        ari.Sid = UserMaps[userId].Sid;
+        ari.SidType = UserMaps[userId].SidType;
+        ari.UserName = UserMaps[userId].UserName;
+
+        AppResourceUseInfos.Add(ari.Id, ari);
+    }
+
+    private void GetNetworkConnections(EseRecord row)
+    {
+        var id = row.Int32("AutoIncId");
+        var appId = row.Int32("AppId");
+        var userId = row.Int32("UserId");
+        var iL = row.Int64("InterfaceLuid");
+        var pf = row.Int32("L2ProfileFlags");
+        var pId = row.Int32("L2ProfileId");
+        var dt = row.DateTime("TimeStamp");
+
+        var ct = row.Int32("ConnectedTime");
+        var cst = row.Int64("ConnectStartTime");
+
+        var cstV = DateTimeOffset.FromFileTime(cst).ToUniversalTime();
+
+        var profile = string.Empty;
+        if (ProfileIndexToSsid.ContainsKey(pId))
         {
-            var id = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "AutoIncId"));
-            var appId = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "AppId"));
-            var userId = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "UserId"));
-            var iL = Api.RetrieveColumnAsInt64(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "InterfaceLuid"));
-            var pf = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "L2ProfileFlags"));
-            var pId = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "L2ProfileId"));
-            var dt = Api.RetrieveColumnAsDateTime(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "TimeStamp"));
+            profile = ProfileIndexToSsid[pId];
+        }
 
-            var ct = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "ConnectedTime"));
-            var cst = Api.RetrieveColumnAsInt64(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "ConnectStartTime"));
+        var nu = new NetworkConnection(id, dt, ct, cstV, iL, pf, pId, userId, appId, profile);
 
-            var cstV = DateTimeOffset.FromFileTime(cst.Value).ToUniversalTime();
+        nu.ExeInfo = AppMaps[appId].ExeInfo;
+        nu.ExeInfoDescription = AppMaps[appId].ExeInfoDescription;
+        nu.ExeTimestamp = AppMaps[appId].Timestamp;
+        nu.Sid = UserMaps[userId].Sid;
+        nu.SidType = UserMaps[userId].SidType;
+        nu.UserName = UserMaps[userId].UserName;
 
-            var profile = string.Empty;
-            if (ProfileIndexToSsid.ContainsKey(pId.Value))
+        NetworkConnections.Add(nu.Id, nu);
+    }
+
+    private void GetPushNotifications(EseRecord row)
+    {
+        var id = row.Int32("AutoIncId");
+        var appId = row.Int32("AppId");
+        var userId = row.Int32("UserId");
+        var nT = row.Int32("NetworkType");
+        var notT = row.Int32("NotificationType");
+        var ps = row.Int32("PayloadSize");
+        var dt = row.DateTime("TimeStamp");
+
+        var pu = new PushNotification(id, dt, nT, notT, ps, userId, appId);
+
+        pu.ExeInfo = AppMaps[appId].ExeInfo;
+        pu.ExeInfoDescription = AppMaps[appId].ExeInfoDescription;
+        pu.ExeTimestamp = AppMaps[appId].Timestamp;
+        pu.Sid = UserMaps[userId].Sid;
+        pu.SidType = UserMaps[userId].SidType;
+        pu.UserName = UserMaps[userId].UserName;
+
+        PushNotifications.Add(pu.Id, pu);
+    }
+
+    private void GetEnergyUsagesLt(EseRecord row)
+    {
+        // TABLE: {FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT
+        // ActiveAcTime: Long
+        // ActiveDcTime: Long
+        // ActiveDischargeTime: Long
+        // ActiveEnergy: Long
+        // AppId: Long
+        // AutoIncId: Long
+        // ConfigurationHash: LongLong
+        // CsAcTime: Long
+        // CsDcTime: Long
+        // CsDischargeTime: Long
+        // CsEnergy: Long
+        // CycleCount: Long
+        // DesignedCapacity: Long
+        // FullChargedCapacity: Long
+        // TimeStamp: DateTime
+        // UserId: Long
+
+
+        var id = row.Int32("AutoIncId");
+        var appId = row.Int32("AppId");
+        var userId = row.Int32("UserId");
+
+        var dt = row.DateTime("TimeStamp");
+
+        var designedCapacity = row.Int32("DesignedCapacity");
+        var fullChargedCapacity = row.Int32("FullChargedCapacity");
+
+        var cycleCount = row.Int32("CycleCount");
+
+
+        var activeAcTime = row.Int32("ActiveAcTime");
+        var activeDcTime = row.Int32("ActiveDcTime");
+        var activeDischargeTime = row.Int32("ActiveDischargeTime");
+        var activeEnergy = row.Int32("ActiveEnergy");
+        var csAcTime = row.Int32("CsAcTime");
+        var csDcTime = row.Int32("CsDcTime");
+        var csDischargeTime = row.Int32("CsDischargeTime");
+        var csEnergy = row.Int32("CsEnergy");
+
+
+        var configurationHash = row.Int64("ConfigurationHash");
+
+        var pu = new EnergyUsage(id, true, dt, userId, appId, configurationHash, -1, -1, -1, cycleCount, designedCapacity, fullChargedCapacity, activeAcTime, activeDcTime, activeDischargeTime, activeEnergy, csAcTime, csDcTime, csDischargeTime, csEnergy);
+
+        EnergyUsages.Add(pu.Id, pu);
+
+        _lastEnergyId = pu.Id;
+    }
+
+    private void GetEnergyUsages(EseRecord row)
+    {
+        // TABLE: {FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}
+        // AppId: Long
+        // AutoIncId: Long
+        // ChargeLevel: Long
+        // ConfigurationHash: LongLong
+        // CycleCount: Long
+        // DesignedCapacity: Long
+        // EventTimestamp: LongLong
+        // FullChargedCapacity: Long
+        // StateTransition: Long
+        // TimeStamp: DateTime
+        // UserId: Long
+
+
+        var id = row.Int32("AutoIncId");
+        var appId = row.Int32("AppId");
+        var userId = row.Int32("UserId");
+
+        var dt = row.DateTime("TimeStamp");
+
+        var designedCapacity = row.Int32("DesignedCapacity");
+        var fullChargedCapacity = row.Int32("FullChargedCapacity");
+        var stateTransition = row.Int32("StateTransition");
+        var cycleCount = row.Int32("CycleCount");
+        var chargeLevel = row.Int32("ChargeLevel");
+
+        var eventTimestamp = row.Int64("EventTimestamp");
+        var configurationHash = row.Int64("ConfigurationHash");
+
+        var pu = new EnergyUsage(id, false, dt, userId, appId, configurationHash, eventTimestamp, stateTransition, chargeLevel, cycleCount, designedCapacity, fullChargedCapacity, -1, -1, -1, -1, -1, -1, -1, -1);
+
+        if (EnergyUsages.ContainsKey(pu.Id))
+        {
+            while (EnergyUsages.ContainsKey(_lastEnergyId))
             {
-                profile = ProfileIndexToSsid[pId.Value];
+                _lastEnergyId += 1;
             }
 
-            var nu = new NetworkConnection(id.Value, dt.Value, ct.Value, cstV, iL.Value, pf.Value, pId.Value, userId.Value, appId.Value, profile);
 
-            nu.ExeInfo = AppMaps[appId.Value].ExeInfo;
-            nu.ExeInfoDescription = AppMaps[appId.Value].ExeInfoDescription;
-            nu.ExeTimestamp = AppMaps[appId.Value].Timestamp;
-            nu.Sid = UserMaps[userId.Value].Sid;
-            nu.SidType = UserMaps[userId.Value].SidType;
-            nu.UserName = UserMaps[userId.Value].UserName;
-
-            NetworkConnections.Add(nu.Id, nu);
+            Log.Warning("Id {Id} in use from LT table. Incrementing by {LastSeen}",pu.Id,_lastEnergyId);
+            pu.Id += _lastEnergyId;
         }
 
-        Api.JetResetTableSequential(session, networkUsageTable
-            , ResetTableSequentialGrbit.None);
+        EnergyUsages.Add(pu.Id, pu);
     }
 
-
-    /// <summary>
-    ///     {973F5D5C-1D90-4944-BE8E-24B94231A174}
-    /// </summary>
-    /// <param name="session"></param>
-    /// <param name="dbid"></param>
-    private void GetNetworkUsageInfo(Session session, JET_DBID dbid)
+    private void GetVfuprovs(EseRecord row)
     {
-        using var networkUsageTable = new Table(session, dbid, "{973F5D5C-1D90-4944-BE8E-24B94231A174}", OpenTableGrbit.ReadOnly);
+        var id = row.Int32("AutoIncId");
+        var appId = row.Int32("AppId");
+        var userId = row.Int32("UserId");
 
-        Api.JetSetTableSequential(session, networkUsageTable, SetTableSequentialGrbit.None);
+        var flags = row.Int32("Flags");
 
-        Api.MoveBeforeFirst(session, networkUsageTable);
+        var endTime = row.Int64("EndTime");
+        var startTime = row.Int64("StartTime");
 
-        while (Api.TryMoveNext(session, networkUsageTable))
-        {
-            var id = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "AutoIncId"));
-            var appId = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "AppId"));
-            var userId = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "UserId"));
-            var br = Api.RetrieveColumnAsInt64(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "BytesRecvd"));
-            var bs = Api.RetrieveColumnAsInt64(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "BytesSent"));
-            var iL = Api.RetrieveColumnAsInt64(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "InterfaceLuid"));
-            var pf = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "L2ProfileFlags"));
-            var pId = Api.RetrieveColumnAsInt32(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "L2ProfileId"));
-            var dt = Api.RetrieveColumnAsDateTime(session, networkUsageTable, Api.GetTableColumnid(session, networkUsageTable, "TimeStamp"));
+        var dt = row.DateTime("TimeStamp");
 
-            var profile = string.Empty;
-            if (ProfileIndexToSsid.ContainsKey(pId.Value))
-            {
-                profile = ProfileIndexToSsid[pId.Value];
-            }
+        var pu = new Vfuprov(id, dt, userId, appId, flags, startTime, endTime);
 
-            var nu = new NetworkUsage(id.Value, dt.Value, appId.Value, userId.Value, br.Value, bs.Value, iL.Value, pf.Value, pId.Value, profile);
+        pu.ExeInfo = AppMaps[appId].ExeInfo;
+        pu.ExeInfoDescription = AppMaps[appId].ExeInfoDescription;
+        pu.ExeTimestamp = AppMaps[appId].Timestamp;
+        pu.Sid = UserMaps[userId].Sid;
+        pu.SidType = UserMaps[userId].SidType;
+        pu.UserName = UserMaps[userId].UserName;
 
-            nu.ExeInfo = AppMaps[appId.Value].ExeInfo;
-            nu.ExeInfoDescription = AppMaps[appId.Value].ExeInfoDescription;
-            nu.ExeTimestamp = AppMaps[appId.Value].Timestamp;
-            nu.Sid = UserMaps[userId.Value].Sid;
-            nu.SidType = UserMaps[userId.Value].SidType;
-            nu.UserName = UserMaps[userId.Value].UserName;
-
-
-            NetworkUsages.Add(nu.Id, nu);
-        }
-
-        Api.JetResetTableSequential(session, networkUsageTable
-            , ResetTableSequentialGrbit.None);
+        Vfuprovs.Add(pu.Id, pu);
     }
 
-    /// <summary>
-    ///     {D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}
-    /// </summary>
-    /// <param name="session"></param>
-    /// <param name="dbid"></param>
-    private void GetApplicationResourceUsage(Session session, JET_DBID dbid)
+    private void GetAppTimelines(EseRecord row)
     {
-        using var appResourceUsage
-            = new Table(session, dbid, "{D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}", OpenTableGrbit.ReadOnly);
+        var id = row.Int32("AutoIncId");
+        var appId = row.Int32("AppId");
+        var userId = row.Int32("UserId");
 
-        Api.JetSetTableSequential(session, appResourceUsage, SetTableSequentialGrbit.None);
+        var dur = row.Int32("DurationMS");
 
-        Api.MoveBeforeFirst(session, appResourceUsage);
+        var endTime = row.Int64("EndTime");
 
-        while (Api.TryMoveNext(session, appResourceUsage))
-        {
-            var id = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "AutoIncId"));
+        var dt = row.DateTime("TimeStamp");
 
-            var appId = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "AppId"));
+        var pu = new TimelineProvider(id, dt, userId, appId, dur, endTime);
 
-            var userId = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "UserId"));
+        pu.ExeInfo = AppMaps[appId].ExeInfo;
+        pu.ExeInfoDescription = AppMaps[appId].ExeInfoDescription;
+        pu.ExeTimestamp = AppMaps[appId].Timestamp;
+        pu.Sid = UserMaps[userId].Sid;
+        pu.SidType = UserMaps[userId].SidType;
+        pu.UserName = UserMaps[userId].UserName;
 
-            var dt = Api.RetrieveColumnAsDateTime(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "TimeStamp"));
-
-            var bbr = Api.RetrieveColumnAsInt64(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "BackgroundBytesRead"));
-            var bbw = Api.RetrieveColumnAsInt64(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "BackgroundBytesWritten"));
-            var bct = Api.RetrieveColumnAsInt64(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "BackgroundCycleTime"));
-            var fbr = Api.RetrieveColumnAsInt64(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "ForegroundBytesRead"));
-            var fbw = Api.RetrieveColumnAsInt64(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "ForegroundBytesWritten"));
-            var fct = Api.RetrieveColumnAsInt64(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "ForegroundCycleTime"));
-            var ft = Api.RetrieveColumnAsInt64(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "FaceTime"));
-
-
-            var bcs = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "BackgroundContextSwitches"));
-            var bnf = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "BackgroundNumberOfFlushes"));
-            var bro = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "BackgroundNumReadOperations"));
-            var bwo = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "BackgroundNumWriteOperations"));
-
-            var fcs = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "ForegroundContextSwitches"));
-            var fnf = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "ForegroundNumberOfFlushes"));
-            var fro = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "ForegroundNumReadOperations"));
-            var fwo = Api.RetrieveColumnAsInt32(session, appResourceUsage, Api.GetTableColumnid(session, appResourceUsage, "ForegroundNumWriteOperations"));
-
-            var ari = new AppResourceUseInfo(id.Value, dt.Value, appId.Value, userId.Value, bbr.Value, bbw.Value, bct.Value, ft.Value, fbr.Value, fbw.Value, fct.Value, bcs.Value, bnf.Value, bro.Value, bwo.Value, fcs.Value, fnf.Value, fro.Value,
-                fwo.Value);
-
-            ari.ExeInfo = AppMaps[appId.Value].ExeInfo;
-            ari.ExeInfoDescription = AppMaps[appId.Value].ExeInfoDescription;
-            ari.ExeTimestamp = AppMaps[appId.Value].Timestamp;
-            ari.Sid = UserMaps[userId.Value].Sid;
-            ari.SidType = UserMaps[userId.Value].SidType;
-            ari.UserName = UserMaps[userId.Value].UserName;
-
-            AppResourceUseInfos.Add(ari.Id, ari);
-        }
-
-        Api.JetResetTableSequential(session, appResourceUsage, ResetTableSequentialGrbit.None);
+        TimelineProviders.Add(pu.Id, pu);
     }
-
-
     public static InterfaceType GetInterfaceTypeFromLuid(long val)
     {
         var b = BitConverter.GetBytes(val);
@@ -1718,63 +1647,6 @@ public class Srum
 
         return (InterfaceType)intType;
     }
-
-
-    private void BuildIdMap(Session session, JET_DBID dbid)
-    {
-        using var idMapTable = new Table(session, dbid, "SruDbIdMapTable", OpenTableGrbit.ReadOnly);
-
-        Api.JetSetTableSequential(session, idMapTable, SetTableSequentialGrbit.None);
-
-        Api.MoveBeforeFirst(session, idMapTable);
-
-        while (Api.TryMoveNext(session, idMapTable))
-        {
-            var idType = Api.RetrieveColumnAsByte(session, idMapTable, Api.GetTableColumnid(session, idMapTable, "IdType"));
-            var index = Api.RetrieveColumnAsInt32(session, idMapTable, Api.GetTableColumnid(session, idMapTable, "IdIndex"));
-            var blob = Api.RetrieveColumn(session, idMapTable, Api.GetTableColumnid(session, idMapTable, "IdBlob"));
-
-            var outVal = string.Empty;
-            var userName = string.Empty;
-
-            switch (idType)
-            {
-                case 0:
-                case 1:
-                case 2:
-                    if (blob != null)
-                    {
-                        outVal = Encoding.Unicode.GetString(blob).Trim('\0');
-                    }
-
-
-                    var app = new AppInfo(index.Value, (MapType)idType, outVal);
-
-                    AppMaps.Add(app.Index, app);
-
-                    break;
-
-                case 3:
-                    outVal = ConvertHexStringToSidString(blob);
-
-                    if (SidToUser.ContainsKey(outVal))
-                    {
-                        userName = SidToUser[outVal];
-                    }
-
-
-                    var user = new UserInfo(index.Value, outVal, userName);
-
-                    UserMaps.Add(user.Index, user);
-
-                    break;
-            }
-        }
-
-        Api.JetResetTableSequential(session, idMapTable
-            , ResetTableSequentialGrbit.None);
-    }
-
 
     public static SidTypeEnum GetSidTypeFromSidString(string sid)
     {

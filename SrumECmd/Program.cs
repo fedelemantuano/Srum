@@ -1,4 +1,5 @@
-﻿using System;
+using SrumData.Readers;
+using System;
 using System.Collections.Generic;
 using System.CommandLine;
 using System.CommandLine.Help;
@@ -123,6 +124,12 @@ internal class Program
             Description = "File name to save JSON Lines results to. Overrides the default name; requires --json"
         };
         
+        var readerOpt = new Option<string>("--reader")
+        {
+            Description = "ESE reader: auto (Windows ESENT, otherwise Dissect), esent, dissect",
+            DefaultValueFactory = _ => "auto"
+        };
+
         var fOpt = new Option<string>("-f")
         {
             Description = "SRUDB.dat file to parse"
@@ -167,7 +174,8 @@ internal class Program
            jsonfOpt,
            dtOpt,
            debugOpt,
-           traceOpt
+           traceOpt,
+           readerOpt
         
         };
 
@@ -175,6 +183,9 @@ internal class Program
 
         _rootCommand.Validators.Add(result =>
         {
+            var reader = result.GetValue(readerOpt) ?? "auto";
+            if (!new[] { "auto", "esent", "dissect" }.Contains(reader.ToLowerInvariant()))
+                result.AddError("--reader must be auto, esent, or dissect.");
             if (string.IsNullOrWhiteSpace(result.GetValue(fOpt)) &&
                 string.IsNullOrWhiteSpace(result.GetValue(dOpt)))
             {
@@ -201,11 +212,11 @@ internal class Program
             }
         });
 
-        _rootCommand.SetAction(result => DoWork(result.GetValue(fOpt),result.GetValue(rOpt),result.GetValue(dOpt),result.GetValue(csvOpt),result.GetValue(jsonOpt),result.GetValue(jsonfOpt),result.GetValue(dtOpt),result.GetValue(debugOpt),result.GetValue(traceOpt)));
+        _rootCommand.SetAction(result => DoWork(result.GetValue(fOpt),result.GetValue(rOpt),result.GetValue(dOpt),result.GetValue(csvOpt),result.GetValue(jsonOpt),result.GetValue(jsonfOpt),result.GetValue(dtOpt),result.GetValue(debugOpt),result.GetValue(traceOpt),result.GetValue(readerOpt)));
         return _rootCommand;
     }
 
-    private static void DoWork(string f, string r, string d, string csv, string json, string jsonf, string dt, bool debug, bool trace)
+    private static int DoWork(string f, string r, string d, string csv, string json, string jsonf, string dt, bool debug, bool trace, string reader)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -229,36 +240,26 @@ internal class Program
 
         Log.Logger = conf.CreateLogger();
 
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            Console.WriteLine();
-            Log.Fatal(
-                "Non-Windows platforms not supported due to the need to load ESI specific Windows libraries! Exiting...");
-            Console.WriteLine();
-            Environment.Exit(0);
-            return;
-        }
-
         if (f.IsNullOrEmpty() && d.IsNullOrEmpty())
         {
             var aaa = new CustomHelpAction(new HelpAction());
             aaa.Invoke(_rootCommand.Parse("Either -f or -d is required. Exiting"));
 
             //Log.Warning("Either -f or -d is required. Exiting");
-            return;
+            return 1;
         }
 
 
         if (f.IsNullOrEmpty() == false && !File.Exists(f))
         {
             Log.Warning("File '{File}' not found. Exiting", f);
-            return;
+            return 1;
         }
 
         if (d.IsNullOrEmpty() == false && !Directory.Exists(d))
         {
             Log.Warning("Directory '{D}' not found. Exiting", d);
-            return;
+            return 1;
         }
 
         if (csv.IsNullOrEmpty() && json.IsNullOrEmpty())
@@ -267,12 +268,12 @@ internal class Program
             aaa.Invoke(_rootCommand.Parse("Either --csv or --json is required. Exiting"));
 
             //Log.Warning("Either -f or -d is required. Exiting");
-            return;
+            return 1;
         }
 
         Log.Information("{Header}", Header);
         Console.WriteLine();
-        Log.Information("Command line: {Args}\r\n", string.Join(" ", _args));
+        Log.Information("Command line: {Args}\r\n", string.Join(" ", _args ?? Array.Empty<string>()));
 
         if (IsAdministrator() == false)
         {
@@ -302,56 +303,24 @@ internal class Program
             files2 =
                 Directory.EnumerateFileSystemEntries(d, "SRUDB.DAT", enumerationOptions);
 
-            f = files2.FirstOrDefault();
+            var candidates = files2.Take(2).ToArray();
+            if (candidates.Length > 1)
+            {
+                Log.Error("Multiple SRUDB.dat files found. Process each evidence directory separately or use -f.");
+                return 1;
+            }
+            f = candidates.FirstOrDefault();
 
             if (f.IsNullOrEmpty())
             {
                 Log.Warning("Did not locate any files named 'SRUDB.dat'! Exiting");
-                return;
+                return 1;
             }
 
-            string esentutlOutput = "";
-            try
-            {
-                var esentutlProcess = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = "esentutl.exe",
-                        Arguments = $"/mh \"{f}\"",
-                        RedirectStandardOutput = true,
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    }
-                };
-                esentutlProcess.Start();
-                esentutlOutput = esentutlProcess.StandardOutput.ReadToEnd();
-                esentutlProcess.WaitForExit();
-
-                if (esentutlProcess.ExitCode != 0)
-                {
-                    Log.Warning("esentutl.exe did not run successfully. Exit code: {ExitCode}",
-                        esentutlProcess.ExitCode);
-                }
-
-                string state = Regex.Match(esentutlOutput, @"State:\s*(.*)").Groups[1].Value.Trim();
-                string formatVersion = Regex.Match(esentutlOutput, @"Format ulVersion:\s*.*\(.* (\d{4})\)").Groups[1].Value;
-                string engineVersion = Regex.Match(esentutlOutput, @"Engine ulVersion:\s*.*\(.* (\d{4})\)").Groups[1].Value;
-                
-                // if the Format Version is newer (aka larger) than the Engine Version, find a newer system to repair the SRUDB.dat file with. If Format Version is equal or older (aka smaller), then you should be able to repair the SRUDB.dat file on your system 
-
-                Log.Information("Found SRUM database file '{F}' (State: {State}, Format Version: {FormatVersion}, Engine Version: {EngineVersion})", f, state, formatVersion, engineVersion);
-                
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "An error occurred while running esentutl.exe");
-            }
-            
             files2 =
                 Directory.EnumerateFileSystemEntries(d, "SOFTWARE", enumerationOptions);
 
-            r = files2.FirstOrDefault();
+            r = string.IsNullOrWhiteSpace(r) ? files2.FirstOrDefault() : r;
 
             if (r.IsNullOrEmpty())
             {
@@ -392,12 +361,18 @@ internal class Program
              files2 =
                 Directory.EnumerateFileSystemEntries(d, dirEnumOptions, ilter);
 
-            f = files2.FirstOrDefault();
+            var candidates = files2.Take(2).ToArray();
+            if (candidates.Length > 1)
+            {
+                Log.Error("Multiple SRUDB.dat files found. Process each evidence directory separately or use -f.");
+                return 1;
+            }
+            f = candidates.FirstOrDefault();
 
             if (f.IsNullOrEmpty())
             {
                 Log.Warning("Did not locate any files named 'SRUDB.dat'! Exiting");
-                return;
+                return 1;
             }
 
             Log.Information("Found SRUM database file '{F}'!", f);
@@ -426,7 +401,7 @@ internal class Program
                 Directory.EnumerateFileSystemEntries(d, dirEnumOptions, ilter);
             
             
-            r = files2.FirstOrDefault();
+            r = string.IsNullOrWhiteSpace(r) ? files2.FirstOrDefault() : r;
 
             if (r.IsNullOrEmpty())
             {
@@ -445,7 +420,7 @@ internal class Program
         try
         {
             Log.Information("Processing '{F}'...", f);
-            sr = new Srum(f, r);
+            sr = new Srum(f, r, (EseReaderKind)Enum.Parse(typeof(EseReaderKind), reader ?? "auto", true));
 
             Console.WriteLine();
             Log.Information("Processing complete!");
@@ -470,21 +445,18 @@ internal class Program
         }
         catch (Exception e)
         {
-            Log.Error(e,
-                "Error processing file! Message: {Message}.\r\n\r\nThis almost always means the database is dirty and must be repaired. This can be verified by running 'esentutl.exe /mh SRUDB.dat' and examining the 'State' property",
-                e.Message);
-            Console.WriteLine();
-            Log.Information(
-                "If the database is dirty, **make a copy of your files**, ensure all files in the directory are not Read-only, open a PowerShell session as an admin, and repair by using the following commands (change directories to the location of SRUDB.dat first):\r\n\r\n'esentutl.exe /r sru /i'\r\n'esentutl.exe /p SRUDB.dat'\r\n\r\n");
-            Environment.Exit(0);
+            Log.Error(e, "Cannot parse database: {Message}. No export was written.", e.Message);
+            return 1;
         }
+
+        var exitCode = sr.HasIncompleteData ? 2 : 0;
 
         if (!string.IsNullOrWhiteSpace(json))
         {
             var jsonExitCode = ExportJson(json, jsonf, ts, JsonExporter.GetRecords(sr), f, r);
             if (jsonExitCode != 0)
             {
-                Environment.ExitCode = jsonExitCode;
+                exitCode = jsonExitCode;
             }
         }
 
@@ -503,7 +475,7 @@ internal class Program
                 {
                     Log.Fatal(
                         "Unable to create directory '{Csv}'. Does a file with the same name exist? Exiting", csv);
-                    return;
+                    return 1;
                 }
             }
 
@@ -514,8 +486,6 @@ internal class Program
 
             Log.Information("CSV output will be saved to '{Csv}'\r\n", csv);
 
-            StreamWriter swCsv;
-            CsvWriter csvWriter;
             try
             {
                 Log.Debug("Dumping Energy Usage tables '{TableName}'", EnergyUsage.TableName);
@@ -524,9 +494,9 @@ internal class Program
 
                 outFile = Path.Combine(csv, outName);
 
-                swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+                using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-                csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+                using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
                 var foo = csvWriter.Context.AutoMap<EnergyUsage>();
                 foo.Map(t => t.Timestamp).Convert(t =>
@@ -545,6 +515,7 @@ internal class Program
             }
             catch (Exception e)
             {
+                exitCode = 1;
                 Log.Error(e, "Error exporting 'EnergyUsage' data! Error: {Message}", e.Message);
             }
 
@@ -557,9 +528,9 @@ internal class Program
 
                 outFile = Path.Combine(csv, outName);
 
-                swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+                using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-                csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+                using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
                 var foo = csvWriter.Context.AutoMap<TimelineProvider>();
                 foo.Map(t => t.Timestamp).Convert(t =>
@@ -578,6 +549,7 @@ internal class Program
             }
             catch (Exception e)
             {
+                exitCode = 1;
                 Log.Error(e, "Error exporting 'AppTimelineProvider' data! Error: {Message}", e.Message);
             }
 
@@ -589,9 +561,9 @@ internal class Program
 
                 outFile = Path.Combine(csv, outName);
 
-                swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+                using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-                csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+                using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
                 var foo = csvWriter.Context.AutoMap<Vfuprov>();
                 foo.Map(t => t.Timestamp).Convert(t =>
@@ -612,6 +584,7 @@ internal class Program
             }
             catch (Exception e)
             {
+                exitCode = 1;
                 Log.Error(e, "Error exporting 'vfuprov' data! Error: {Message}", e.Message);
             }
 
@@ -623,9 +596,9 @@ internal class Program
 
                 outFile = Path.Combine(csv, outName);
 
-                swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+                using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-                csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+                using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
                 var foo = csvWriter.Context.AutoMap<AppResourceUseInfo>();
                 foo.Map(t => t.Timestamp).Convert(t =>
@@ -642,6 +615,7 @@ internal class Program
             }
             catch (Exception e)
             {
+                exitCode = 1;
                 Log.Error(e, "Error exporting 'AppResourceUseInfo' data! Error: {Message}", e.Message);
             }
 
@@ -653,9 +627,9 @@ internal class Program
 
                 outFile = Path.Combine(csv, outName);
 
-                swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+                using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-                csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+                using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
                 var foo = csvWriter.Context.AutoMap<NetworkConnection>();
                 foo.Map(t => t.Timestamp).Convert(t =>
@@ -674,6 +648,7 @@ internal class Program
             }
             catch (Exception e)
             {
+                exitCode = 1;
                 Log.Error(e, "Error exporting 'NetworkConnection' data! Error: {Message}", e.Message);
             }
 
@@ -685,9 +660,9 @@ internal class Program
 
                 outFile = Path.Combine(csv, outName);
 
-                swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+                using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-                csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+                using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
                 var foo = csvWriter.Context.AutoMap<NetworkUsage>();
                 foo.Map(t => t.Timestamp).Convert(t =>
@@ -704,6 +679,7 @@ internal class Program
             }
             catch (Exception e)
             {
+                exitCode = 1;
                 Log.Error(e, "Error exporting 'NetworkUsage' data! Error: {Message}", e.Message);
             }
 
@@ -715,9 +691,9 @@ internal class Program
 
                 outFile = Path.Combine(csv, outName);
 
-                swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
+                using var swCsv = new StreamWriter(outFile, false, Encoding.UTF8);
 
-                csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
+                using var csvWriter = new CsvWriter(swCsv, CultureInfo.InvariantCulture);
 
                 var foo = csvWriter.Context.AutoMap<PushNotification>();
                 foo.Map(t => t.Timestamp).Convert(t =>
@@ -734,13 +710,28 @@ internal class Program
             }
             catch (Exception e)
             {
+                exitCode = 1;
                 Log.Error(e, "Error exporting 'PushNotification' data! Error: {Message}", e.Message);
             }
 
         }
 
+        try
+        {
+            var reportPath = !string.IsNullOrWhiteSpace(json)
+                ? JsonExporter.GetOutputPath(json, jsonf, ts) + ".diagnostics.json"
+                : Path.Combine(csv, $"{ts:yyyyMMddHHmmss}_SrumECmd.diagnostics.json");
+            ProcessingReport.Write(reportPath, sr, f, r, exitCode);
+            Log.Information("Diagnostics saved to '{ReportPath}'", reportPath);
+        }
+        catch (Exception e)
+        {
+            Log.Error(e, "Cannot write processing diagnostics.");
+            exitCode = 1;
+        }
         sw.Stop();
         Log.Information("Processing completed in {TotalSeconds:N4} seconds\r\n", sw.Elapsed.TotalSeconds);
+        return exitCode;
     }
 
     internal static int ExportJson(string directory, string filename, DateTimeOffset exportTime,

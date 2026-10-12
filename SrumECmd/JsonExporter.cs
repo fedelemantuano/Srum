@@ -68,19 +68,27 @@ internal static class JsonExporter
     internal static void Write(string outputPath, IEnumerable<object> records)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath)));
-        using var writer = new StreamWriter(outputPath, false, new UTF8Encoding(false));
-        writer.NewLine = "\n";
-        using var scope = JsConfig.With(new Config
+        var temporary = outputPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
         {
-            IncludeNullValues = true,
-            IncludeNullValuesInDictionaries = true,
-            ExcludeTypeInfo = true,
-            TextCase = TextCase.Default
-        });
-
-        foreach (var record in records)
+            using (var writer = new StreamWriter(temporary, false, new UTF8Encoding(false)))
+            using (JsConfig.With(new Config
+            {
+                IncludeNullValues = true,
+                IncludeNullValuesInDictionaries = true,
+                ExcludeTypeInfo = true,
+                TextCase = TextCase.Default
+            }))
+            {
+                writer.NewLine = "\n";
+                foreach (var record in records) writer.WriteLine(Serialize(record));
+            }
+            if (File.Exists(outputPath)) File.Replace(temporary, outputPath, null);
+            else File.Move(temporary, outputPath);
+        }
+        finally
         {
-            writer.WriteLine(Serialize(record));
+            if (File.Exists(temporary)) File.Delete(temporary);
         }
     }
 
