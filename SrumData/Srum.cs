@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using SrumData.Readers;
 using System;
 using System.Collections.Generic;
@@ -7,7 +6,6 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
-using Microsoft.Isam.Esent.Interop;
 using Registry;
 using Serilog;
 using ServiceStack;
@@ -1090,24 +1088,10 @@ public class Srum
     public readonly Dictionary<int, Vfuprov> Vfuprovs;
     public readonly Dictionary<int, UserInfo> UserMaps;
 
-    public EseReaderKind ReaderKind { get; }
-    public int DatabaseState { get; private set; }
-    public bool HasIncompleteData => (ReaderKind == EseReaderKind.Dissect && DatabaseState != 3) || ParsingErrorCount > 0;
-    public int ParsingErrorCount { get; private set; }
-    public List<string> ParsingErrors { get; } = new();
-    public List<string> MissingTables { get; } = new();
-    public Dictionary<string, int> RowsRead { get; } = new();
-    public Dictionary<string, int> RowsParsed { get; } = new();
     private int _lastEnergyId;
 
-    public Srum(string fileName, string softwareHive) : this(fileName, softwareHive, EseReaderKind.Auto) { }
-
-    public Srum(string fileName, string softwareHive, EseReaderKind readerKind)
-        : this(fileName, softwareHive, CreateReader(readerKind), ResolveReader(readerKind)) { }
-
-    internal Srum(string fileName, string softwareHive, IEseReader reader, EseReaderKind readerKind)
+    public Srum(string fileName, string softwareHive)
     {
-        ReaderKind = readerKind;
         if (File.Exists(fileName) == false)
         {
             throw new FileNotFoundException($"{fileName} does not exist!");
@@ -1211,6 +1195,8 @@ public class Srum
             ["{7ACBBAA3-D029-4BE4-9A7A-0885927F1D8F}"] = GetVfuprovs,
             ["{5C8CF1C7-7257-4F13-B223-970EF5939312}"] = GetAppTimelines,
         };
+        var reader = new PortableEseReader();
+        var failedTables = new HashSet<string>(StringComparer.Ordinal);
         // ID mappings must precede activity tables; energy LT precedes non-LT for legacy IDs.
         foreach (var record in reader.ReadDatabase(fileName, new[]
         {
@@ -1223,56 +1209,44 @@ public class Srum
             switch (record.Kind)
             {
                 case "database":
-                    DatabaseState = record.State;
-                    if (ReaderKind == EseReaderKind.Dissect && DatabaseState != 3)
-                        Log.Warning("ESE state {State}: exported pages may be incomplete/inconsistent. Dissect does not replay transaction logs.", DatabaseState);
+                    if (record.Recovery != null)
+                        Log.Information("Supported ESE recovery completed; {Redone} operations redone, {Undone} undone.",
+                            record.Recovery.RedoneOperations, record.Recovery.UndoneOperations);
                     break;
                 case "missing":
                     if (record.Table == "SruDbIdMapTable")
                         throw new InvalidDataException("Missing required SruDbIdMapTable.");
-                    MissingTables.Add(record.Table);
                     Log.Information("Optional SRUM table is absent: {Table}", record.Table);
                     break;
                 case "table":
-                    ValidateSchema(record);
-                    RowsRead.Add(record.Table, 0);
-                    RowsParsed.Add(record.Table, 0);
+                    try
+                    {
+                        ValidateSchema(record);
+                    }
+                    catch when (record.Table != "SruDbIdMapTable")
+                    {
+                        failedTables.Add(record.Table);
+                        Log.Warning("Error processing SRUM table {Table}. Skipping it.", record.Table);
+                    }
                     break;
                 case "row":
-                    RowsRead[record.Table]++;
+                    if (failedTables.Contains(record.Table))
+                        break;
                     try
                     {
                         handlers[record.Table](record);
-                        RowsParsed[record.Table]++;
                     }
                     catch (Exception e) when (e is InvalidDataException || e is ArgumentException ||
                         e is KeyNotFoundException || e is OverflowException || e is FormatException)
                     {
-                        // Preserve other readable rows; bounded diagnostics contain no evidence values.
-                        ParsingErrorCount++;
-                        if (ParsingErrors.Count < 100)
-                            ParsingErrors.Add(record.Table + " row " + RowsRead[record.Table] + ": " + e.GetType().Name);
+                        if (record.Table == "SruDbIdMapTable")
+                            throw;
+                        failedTables.Add(record.Table);
+                        Log.Warning(e, "Error processing SRUM table {Table}: {Message}. Skipping remaining rows.",
+                            record.Table, e.Message);
                     }
                     break;
             }
-        }
-        if (ParsingErrorCount > 0)
-            Log.Warning("{Count} SRUM rows could not be mapped. The export is incomplete.", ParsingErrorCount);
-    }
-
-    private static EseReaderKind ResolveReader(EseReaderKind kind) => kind == EseReaderKind.Auto
-        ? (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? EseReaderKind.Esent : EseReaderKind.Dissect) : kind;
-
-    internal static IEseReader CreateReader(EseReaderKind kind)
-    {
-        switch (ResolveReader(kind))
-        {
-            case EseReaderKind.Dissect: return new DissectReader();
-            case EseReaderKind.Esent:
-                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                    throw new PlatformNotSupportedException("--reader esent requires Windows; use --reader dissect on Linux/macOS.");
-                return new ManagedEsentReader();
-            default: throw new ArgumentOutOfRangeException(nameof(kind));
         }
     }
 
@@ -1312,7 +1286,7 @@ public class Srum
 
     public static void DumpTableInfo(string fileName)
     {
-        foreach (var record in CreateReader(EseReaderKind.Auto).ReadDatabase(fileName, null))
+        foreach (var record in new PortableEseReader().ReadDatabase(fileName, null))
         {
             if (record.Kind != "table") continue;
             Log.Information("TABLE: {Table}", record.Table);

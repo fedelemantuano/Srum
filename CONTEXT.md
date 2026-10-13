@@ -15,3 +15,15 @@ The activity or resource usage category of a SRUM record. The supported categori
 
 **SOFTWARE hive**:
 The Windows registry evidence file used to enrich SRUM records with application, user, and network profile information.
+
+**ESE transaction log**:
+A journal of database operations and transaction boundaries associated with the acquired SRUM database.
+
+**Transactionally consistent state**:
+A database state that reflects supported committed transactions through the selected recovery endpoint and excludes supported changes from transactions left uncommitted at that endpoint.
+
+**Supported ESE recovery**:
+Reconstruction of a transactionally consistent state from the database and all required, valid, matching transaction logs for operations implemented by the included C# reader. This does not mean recovering deleted records or supporting every operation in Windows ESE.
+
+**Recovery limitation**:
+A condition such as missing logs, invalid evidence, or an unsupported operation that prevents the reader from establishing a supported transactionally consistent state. SrumECmd reports the condition and stops before export.

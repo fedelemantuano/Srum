@@ -1,7 +1,6 @@
 **/.git
 **/bin
 **/obj
-**/__pycache__
 **/.DS_Store
 **/*.dat
 **/*.mdb

@@ -1,4 +1,3 @@
-using SrumData.Readers;
 using System;
 using System.Collections.Generic;
 using System.CommandLine;
@@ -13,12 +12,10 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Alphaleonis.Win32.Filesystem;
 using CsvHelper;
 using Exceptionless;
-using Microsoft.Isam.Esent.Interop;
 using Serilog;
 using Serilog.Core;
 using Serilog.Events;
@@ -124,12 +121,6 @@ internal class Program
             Description = "File name to save JSON Lines results to. Overrides the default name; requires --json"
         };
         
-        var readerOpt = new Option<string>("--reader")
-        {
-            Description = "ESE reader: auto (Windows ESENT, otherwise Dissect), esent, dissect",
-            DefaultValueFactory = _ => "auto"
-        };
-
         var fOpt = new Option<string>("-f")
         {
             Description = "SRUDB.dat file to parse"
@@ -174,8 +165,7 @@ internal class Program
            jsonfOpt,
            dtOpt,
            debugOpt,
-           traceOpt,
-           readerOpt
+           traceOpt
         
         };
 
@@ -183,9 +173,6 @@ internal class Program
 
         _rootCommand.Validators.Add(result =>
         {
-            var reader = result.GetValue(readerOpt) ?? "auto";
-            if (!new[] { "auto", "esent", "dissect" }.Contains(reader.ToLowerInvariant()))
-                result.AddError("--reader must be auto, esent, or dissect.");
             if (string.IsNullOrWhiteSpace(result.GetValue(fOpt)) &&
                 string.IsNullOrWhiteSpace(result.GetValue(dOpt)))
             {
@@ -212,11 +199,11 @@ internal class Program
             }
         });
 
-        _rootCommand.SetAction(result => DoWork(result.GetValue(fOpt),result.GetValue(rOpt),result.GetValue(dOpt),result.GetValue(csvOpt),result.GetValue(jsonOpt),result.GetValue(jsonfOpt),result.GetValue(dtOpt),result.GetValue(debugOpt),result.GetValue(traceOpt),result.GetValue(readerOpt)));
+        _rootCommand.SetAction(result => DoWork(result.GetValue(fOpt),result.GetValue(rOpt),result.GetValue(dOpt),result.GetValue(csvOpt),result.GetValue(jsonOpt),result.GetValue(jsonfOpt),result.GetValue(dtOpt),result.GetValue(debugOpt),result.GetValue(traceOpt)));
         return _rootCommand;
     }
 
-    private static int DoWork(string f, string r, string d, string csv, string json, string jsonf, string dt, bool debug, bool trace, string reader)
+    private static int DoWork(string f, string r, string d, string csv, string json, string jsonf, string dt, bool debug, bool trace)
     {
         var levelSwitch = new LoggingLevelSwitch();
 
@@ -420,7 +407,7 @@ internal class Program
         try
         {
             Log.Information("Processing '{F}'...", f);
-            sr = new Srum(f, r, (EseReaderKind)Enum.Parse(typeof(EseReaderKind), reader ?? "auto", true));
+            sr = new Srum(f, r);
 
             Console.WriteLine();
             Log.Information("Processing complete!");
@@ -449,7 +436,7 @@ internal class Program
             return 1;
         }
 
-        var exitCode = sr.HasIncompleteData ? 2 : 0;
+        var exitCode = 0;
 
         if (!string.IsNullOrWhiteSpace(json))
         {
@@ -716,19 +703,6 @@ internal class Program
 
         }
 
-        try
-        {
-            var reportPath = !string.IsNullOrWhiteSpace(json)
-                ? JsonExporter.GetOutputPath(json, jsonf, ts) + ".diagnostics.json"
-                : Path.Combine(csv, $"{ts:yyyyMMddHHmmss}_SrumECmd.diagnostics.json");
-            ProcessingReport.Write(reportPath, sr, f, r, exitCode);
-            Log.Information("Diagnostics saved to '{ReportPath}'", reportPath);
-        }
-        catch (Exception e)
-        {
-            Log.Error(e, "Cannot write processing diagnostics.");
-            exitCode = 1;
-        }
         sw.Stop();
         Log.Information("Processing completed in {TotalSeconds:N4} seconds\r\n", sw.Elapsed.TotalSeconds);
         return exitCode;

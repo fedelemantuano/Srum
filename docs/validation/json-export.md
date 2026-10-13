@@ -8,7 +8,7 @@ Image: `mcr.microsoft.com/dotnet/sdk:9.0`, digest `sha256:1330d3c4144aec2695036a
 
 - Release build of SrumECmd and SrumData for both `net9.0` and `net472`: passed, zero warnings and zero errors.
 - NUnit suite: 20 automated tests passed, zero failures.
-- The legacy `BuildingAutomation` test is explicitly excluded from the ordinary suite because it requires Windows and evidence at hardcoded local paths. It was not executed.
+- The legacy `BuildingAutomation` test is explicitly excluded from the ordinary suite because it requires external evidence at hardcoded local paths. It was not executed.
 - Compiled executable `--help`: passed; the new `--json`, `--jsonf`, and JSON-independent `--dt` behavior are documented in help.
 
 The tests cover all seven record categories, independent JSON lines, field types, strings with Unicode and embedded newlines, large integers, nulls, every timestamp property, seven fractional digits, offset-to-UTC conversion, the JSON-only EnergyUsage interpretation, preservation of record/configuration state, durations, filenames, directory creation, truncation/replacement, empty output, failed writes, input-file protection, and CLI validation/exit status.
@@ -45,8 +45,16 @@ The test suite generated two synthetic JSON Lines files, each containing one rec
 
 Machine-readable [ingestion results](json-export-elasticsearch.json) are retained beside this report. The test container was stopped after validation.
 
+## Real SRUM acceptance
+
+On 2026-10-13, the included C# ESE reader was built through the repository Dockerfile as a Linux x64 runtime image, an exported Linux x64 self-contained directory, and an exported macOS ARM64 self-contained directory. No automated test suite was used for this acceptance. The external `Clean` and `Dirty` Belkasoft CTF evidence directories were mounted read-only.
+
+All three execution forms parsed both evidence directories successfully with exit code `0`. Each export contained 6,811 JSON Lines records: 4,107 TimelineProvider, 2,087 AppResourceUseInfo, 465 NetworkUsage, 101 Vfuprov, 50 NetworkConnection, one EnergyUsage, and no PushNotification records because that optional table was absent. All six exports were byte-identical with SHA-256 `54c19a28166276e5528fe0cceb7bf61197de9d70a0f50ff193e64bf35e2bb9bd`.
+
+The Dirty database used matching adjacent transaction logs and entered the supported recovery path, reporting zero redo and zero undo operations. This validates log-chain acceptance and consistent attachment for this fixture; it does not demonstrate recovery of changed rows. A copy of the Dirty database without its logs exited with code `1` and created no export. Input database and log hashes were unchanged after the runs.
+
 ## Limits
 
-This validates the implemented serializer, CLI contract, compilation of both targets, and real Elasticsearch acceptance of synthetic exported records. It does not validate parsing a real SRUDB.dat, Windows execution of either target, or the complete CLI-to-ESENT-to-Elasticsearch path. Those checks require Windows ESENT and representative SRUM evidence fixtures, which are not supplied in this repository.
+The 2026-10-09 checks validate the serializer, CLI contract, compilation of both targets, and real Elasticsearch acceptance of synthetic exported records. The 2026-10-13 checks validate real SRUM parsing and the recovery boundary for the supplied fixtures. Neither establishes support for every ESE format or transaction operation, and neither validates SOFTWARE-hive enrichment because these fixtures do not contain that hive.
 
 The EnergyUsage rule follows the UTC interpretation of the other six models. It does not independently establish the original timezone semantics of SRUM evidence.

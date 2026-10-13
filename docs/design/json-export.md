@@ -68,13 +68,12 @@ The record's `Id` belongs to its source table and is not a global Elasticsearch 
 
 Use synthetic records to verify one-line parsing, all seven discriminator values, field names and types, nullable values, all temporal properties, UTC conversion, fractional precision, and the JSON-only EnergyUsage interpretation. Verify UTF-8, custom/default filenames, replacement of longer existing output, empty exports, and CLI option combinations.
 
-Check Elasticsearch compatibility against its documented standard date parser and provide an explicit mapping example. A real database parse and end-to-end ingestion require Windows and an Elasticsearch instance; do not describe source checks or synthetic tests as live acceptance.
+Check Elasticsearch compatibility against its documented standard date parser and provide an explicit mapping example. A real database parse and end-to-end ingestion require representative SRUM evidence and an Elasticsearch instance; do not describe source checks or synthetic tests as live acceptance.
 
-The host has no `dotnet` executable and the repository includes no SRUM fixtures. Build, synthetic tests, and Elasticsearch ingestion are verified in isolated Docker containers; real SRUM parsing still requires Windows ESENT. See the [validation report](../validation/json-export.md) for the executed checks and their limits.
+The host has no `dotnet` executable and the repository includes no SRUM fixtures. Builds run in Docker, while real SRUM evidence remains external to the repository. See the [validation report](../validation/json-export.md) for the executed JSON checks and their limits.
 
 ## Sources
 
 - [MFTECmd JSON export](https://github.com/EricZimmerman/MFTECmd/blob/master/MFTECmd/Program.cs): JSON Lines, ISO 8601 configuration, `--json` and `--jsonf`.
 - [Elasticsearch date fields](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/date): default date parser and millisecond indexing resolution.
 - [Elasticsearch 8.19 fractional-second parser tests](https://github.com/elastic/elasticsearch/blob/8.19/server/src/test/java/org/elasticsearch/common/time/DateFormattersTests.java#L671): seven fractional ISO 8601 digits accepted by `strict_date_optional_time`.
-- [ManagedEsent date conversion](https://github.com/microsoft/ManagedEsent/blob/master/EsentInterop/Conversions.cs) and [OLE Automation helper](https://github.com/microsoft/ManagedEsent/blob/master/EsentInterop/LibraryHelpers.cs): official source returns dates without timezone attribution. The repository uses package 3.2.0; its binary behavior has not been executed here.
