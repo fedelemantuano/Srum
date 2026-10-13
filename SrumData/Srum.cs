@@ -1062,6 +1062,19 @@ public enum SidTypeEnum
 // esentutl.exe /r sru /i
 // esentutl.exe /p SRUDB.dat
 
+public sealed class DatabaseReadFailure
+{
+    internal DatabaseReadFailure(string databasePath, Exception exception)
+    {
+        DatabasePath = databasePath;
+        Exception = exception;
+    }
+
+    public string DatabasePath { get; }
+    public string Message => Exception.Message;
+    public Exception Exception { get; }
+}
+
 public class Srum
 {
     public readonly Dictionary<int, AppInfo> AppMaps;
@@ -1087,6 +1100,12 @@ public class Srum
     public readonly Dictionary<int, TimelineProvider> TimelineProviders;
     public readonly Dictionary<int, Vfuprov> Vfuprovs;
     public readonly Dictionary<int, UserInfo> UserMaps;
+    public readonly List<DatabaseReadFailure> ReadFailures;
+
+    public bool HasIncompleteData => ReadFailures.Count != 0;
+    public int ExportableRecordCount => EnergyUsages.Count + TimelineProviders.Count + Vfuprovs.Count +
+                                        AppResourceUseInfos.Count + NetworkConnections.Count +
+                                        NetworkUsages.Count + PushNotifications.Count;
 
     private int _lastEnergyId;
 
@@ -1182,6 +1201,7 @@ public class Srum
         EnergyUsages = new Dictionary<int, EnergyUsage>();
         Vfuprovs = new Dictionary<int, Vfuprov>();
         TimelineProviders = new Dictionary<int, TimelineProvider>();
+        ReadFailures = new List<DatabaseReadFailure>();
 
         var handlers = new Dictionary<string, Action<EseRecord>>
         {
@@ -1198,57 +1218,73 @@ public class Srum
         var reader = new PortableEseReader();
         var failedTables = new HashSet<string>(StringComparer.Ordinal);
         // ID mappings must precede activity tables; energy LT precedes non-LT for legacy IDs.
-        foreach (var record in reader.ReadDatabase(fileName, new[]
+        try
         {
-            "SruDbIdMapTable", NetworkUsage.TableName, AppResourceUseInfo.TableName,
-            NetworkConnection.TableName, PushNotification.TableName,
-            "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT", "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}",
-            Vfuprov.TableName, TimelineProvider.TableName
-        }))
-        {
-            switch (record.Kind)
+            foreach (var record in reader.ReadDatabase(fileName, new[]
             {
-                case "database":
-                    if (record.Recovery != null)
-                        Log.Information("Supported ESE recovery completed; {Redone} operations redone, {Undone} undone.",
-                            record.Recovery.RedoneOperations, record.Recovery.UndoneOperations);
-                    break;
-                case "missing":
-                    if (record.Table == "SruDbIdMapTable")
-                        throw new InvalidDataException("Missing required SruDbIdMapTable.");
-                    Log.Information("Optional SRUM table is absent: {Table}", record.Table);
-                    break;
-                case "table":
-                    try
-                    {
-                        ValidateSchema(record);
-                    }
-                    catch when (record.Table != "SruDbIdMapTable")
-                    {
-                        failedTables.Add(record.Table);
-                        Log.Warning("Error processing SRUM table {Table}. Skipping it.", record.Table);
-                    }
-                    break;
-                case "row":
-                    if (failedTables.Contains(record.Table))
+                "SruDbIdMapTable", NetworkUsage.TableName, AppResourceUseInfo.TableName,
+                NetworkConnection.TableName, PushNotification.TableName,
+                "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}LT", "{FEE4E14F-02A9-4550-B5CE-5FA2DA202E37}",
+                Vfuprov.TableName, TimelineProvider.TableName
+            }))
+            {
+                switch (record.Kind)
+                {
+                    case "database":
+                        if (record.Recovery != null)
+                            Log.Information("Supported ESE recovery completed; {Redone} operations redone, {Undone} undone.",
+                                record.Recovery.RedoneOperations, record.Recovery.UndoneOperations);
                         break;
-                    try
-                    {
-                        handlers[record.Table](record);
-                    }
-                    catch (Exception e) when (e is InvalidDataException || e is ArgumentException ||
-                        e is KeyNotFoundException || e is OverflowException || e is FormatException)
-                    {
+                    case "missing":
                         if (record.Table == "SruDbIdMapTable")
-                            throw;
-                        failedTables.Add(record.Table);
-                        Log.Warning(e, "Error processing SRUM table {Table}: {Message}. Skipping remaining rows.",
-                            record.Table, e.Message);
-                    }
-                    break;
+                            throw new InvalidDataException("Missing required SruDbIdMapTable.");
+                        Log.Information("Optional SRUM table is absent: {Table}", record.Table);
+                        break;
+                    case "table":
+                        try
+                        {
+                            ValidateSchema(record);
+                        }
+                        catch (Exception e) when (record.Table != "SruDbIdMapTable")
+                        {
+                            if (failedTables.Add(record.Table))
+                                ReadFailures.Add(new DatabaseReadFailure(fileName + "#" + record.Table, e));
+                        }
+                        break;
+                    case "row":
+                        if (failedTables.Contains(record.Table))
+                            break;
+                        try
+                        {
+                            handlers[record.Table](record);
+                        }
+                        catch (Exception e) when (e is InvalidDataException || e is ArgumentException ||
+                            e is KeyNotFoundException || e is OverflowException || e is FormatException)
+                        {
+                            if (record.Table == "SruDbIdMapTable")
+                                throw;
+                            if (failedTables.Add(record.Table))
+                                ReadFailures.Add(new DatabaseReadFailure(fileName + "#" + record.Table, e));
+                        }
+                        break;
+                }
             }
         }
+        catch (Exception e) when (IsDatabaseReadFailure(e))
+        {
+            ReadFailures.Add(new DatabaseReadFailure(fileName, e));
+        }
     }
+
+    private static bool IsDatabaseReadFailure(Exception exception) =>
+        exception is EseRecovery.RecoveryRequiredException ||
+        exception is IOException ||
+        exception is NotSupportedException ||
+        exception is UnauthorizedAccessException ||
+        exception is ArgumentException ||
+        exception is KeyNotFoundException ||
+        exception is OverflowException ||
+        exception is FormatException;
 
     private static readonly Dictionary<string, string[]> RequiredColumns = new()
     {

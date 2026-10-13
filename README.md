@@ -37,9 +37,34 @@ A SRUM parser!
 
 ## Included C# ESE reader and Docker build
 
-The ESE reader source is included in `EseRecovery/` and built through a project reference. SrumECmd uses this single C# path on every platform: clean databases open directly, while dirty databases are recovered automatically when the required matching transaction logs are adjacent to `SRUDB.dat`. Missing logs, invalid evidence, or unsupported recovery operations stop processing before export. The public CLI has no backend or recovery-mode selector.
+The ESE reader source is included in `EseRecovery/` and built through a project reference. SrumECmd uses this single C# path on every platform: clean databases open directly, while dirty databases are recovered automatically when the required matching transaction logs are adjacent to `SRUDB.dat`. If recovery fails before any SRUM row is validated, processing stops without an export. A later table-level failure preserves already validated activity records and marks the export incomplete. The public CLI has no backend or recovery-mode selector.
 
 Python, Dissect, Windows `esent.dll`, external NuGet feeds, and external Docker build contexts are not required. The included reader implements the ESE subset required by the supported SRUM datasets; it is not a complete replacement for every Windows ESE operation. See [the included library scope](EseRecovery/README.md).
+
+### Comparison with Windows `esent.dll`
+
+Windows `esent.dll` is the complete ESE database engine. The included `EseRecovery` project is a read-only forensic reader with bounded transaction recovery for the supported SUM and SRUM evidence formats. It intentionally fails instead of exposing a recovered state when a required operation is outside its implemented scope. See Microsoft's [ESE overview](https://learn.microsoft.com/en-us/windows/win32/extensible-storage-engine/extensible-storage-engine) and [ESE files and recovery](https://learn.microsoft.com/en-us/windows/win32/extensible-storage-engine/extensible-storage-engine-files).
+
+| Capability | Windows `esent.dll` | Included `EseRecovery` |
+| --- | --- | --- |
+| Read clean ESE databases | Full engine support | Supported formats only |
+| Read SUM and SRUM tables | Yes | Yes |
+| Validate page and log checksums | Yes | Yes |
+| Validate log signatures and generations | Yes | Yes |
+| Replay inserts, replacements and deletes | Full engine support | Supported unique leaf operations only |
+| Commit, rollback and nested transactions | Full engine support | Bounded implementation |
+| Version store and concurrent updates | Full engine support | Simple validated cases only |
+| B-tree page split, merge and root operations | Yes | No |
+| Page allocation and space-tree recovery | Yes | No |
+| Secondary and non-unique indexes | Yes | No |
+| Multiple databases in one log stream | Yes | No |
+| Torn-write and shadow-log recovery | Yes | No |
+| Create or modify databases | Yes | No; read-only in-memory overlay |
+| Backup, restore and maintenance APIs | Yes | No |
+| General database API | Windows `Jet*` API | Purpose-built forensic API |
+| Platforms | Windows | Linux, macOS and Windows |
+
+Matching output on a clean database demonstrates record-reading compatibility, not complete engine equivalence. A dirty database that reports zero redo and zero undo operations validates log-chain attachment but does not exercise page-changing recovery. Full parity would require Windows-reference fixtures covering committed unflushed changes, rollback, structural B-tree changes, secondary indexes and concurrent versions. Missing required logs cannot be reconstructed by either implementation.
 
 Build the runnable Linux x64 image from the repository root:
 
@@ -100,7 +125,7 @@ See the [Docker validation report](docs/validation/json-export.md) for reproduct
 
 Keep `SRUDB.dat`, `SRU.log`, the numbered `SRU*.log` files, and the checkpoint from the same acquisition together. The reader validates matching log identities and generations, replays the supported committed operations, and removes supported uncommitted changes in memory; it never modifies the evidence files.
 
-If recovery cannot establish a supported consistent state, SrumECmd exits with code `1` and does not create a new JSON or CSV export. Copying unrelated logs beside a dirty database does not make that database recoverable.
+If recovery cannot establish a supported consistent state, SrumECmd exits with code `1` and does not create a new JSON or CSV export. If a later source or optional-table failure occurs after activity records have been validated, those records are exported and the process exits with code `2`. A complete export exits with code `0`. Copying unrelated logs beside a dirty database does not make that database recoverable.
 
 # Download Eric Zimmerman's Tools
 

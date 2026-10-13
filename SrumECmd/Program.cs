@@ -410,7 +410,7 @@ internal class Program
             sr = new Srum(f, r);
 
             Console.WriteLine();
-            Log.Information("Processing complete!");
+            Log.Information(sr.HasIncompleteData ? "Processing completed with incomplete data." : "Processing complete!");
             Console.WriteLine();
 
             Log.Information("{EnergyUse} {EnergyUsagesCount:N0}", "Energy Usage count:".PadRight(30),
@@ -432,11 +432,35 @@ internal class Program
         }
         catch (Exception e)
         {
-            Log.Error(e, "Cannot parse database: {Message}. No export was written.", e.Message);
+            if (debug || trace)
+                Log.Error(e, "Cannot parse database: {Message} No export was written.", e.Message);
+            else
+                Log.Error("Cannot parse database: {Message} No export was written.", e.Message);
             return 1;
         }
 
         var exitCode = 0;
+
+        if (sr.HasIncompleteData)
+        {
+            foreach (var failure in sr.ReadFailures)
+            {
+                if (debug || trace)
+                    Log.Warning(failure.Exception, "Source '{Database}' was skipped: {Message}", failure.DatabasePath, failure.Message);
+                else
+                    Log.Warning("Source '{Database}' was skipped: {Message}", failure.DatabasePath, failure.Message);
+            }
+
+            if (sr.ExportableRecordCount == 0)
+            {
+                Log.Error("No validated SRUM activity records are available. No export was written.");
+                return 1;
+            }
+
+            exitCode = 2;
+            Log.Warning("Processing is incomplete: {FailureCount:N0} source or table error(s) occurred. {RecordCount:N0} validated activity record(s) will be exported.",
+                sr.ReadFailures.Count, sr.ExportableRecordCount);
+        }
 
         if (!string.IsNullOrWhiteSpace(json))
         {
